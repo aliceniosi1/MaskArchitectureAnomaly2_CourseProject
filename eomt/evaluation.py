@@ -133,12 +133,27 @@ def combine_to_per_pixel_scores(mask_logits_raw, class_logits, out_hw):
     return scores
 
 def anomaly_msp(scores_chw, eps=1e-12):
-    # scores are >=0, so I normalize to probabilities
-    p = scores_chw / (scores_chw.sum(dim=0, keepdim=True) + eps)
+    """MSP anomaly score computed from per-pixel class *logits*.
+
+    In the official notebook flow, MSP is defined as:
+        score = 1 - max_c softmax(logits)_c
+
+    Here `scores_chw` is the per-pixel class score map produced by the
+    MaskFormer-style combination of mask and class predictions.
+    We treat it as logits and apply a Softmax across classes.
+    """
+    p = torch.softmax(scores_chw, dim=0)
     return 1.0 - p.max(dim=0).values  # (H,W)
 
 def anomaly_maxentropy(scores_chw, eps=1e-12):
-    p = scores_chw / (scores_chw.sum(dim=0, keepdim=True) + eps)
+    """MaxEntropy anomaly score.
+
+    Defined as the entropy of the Softmax probabilities:
+        score = - sum_c p_c log(p_c),   p = softmax(logits)
+
+    Higher entropy => more uncertainty => more likely OOD.
+    """
+    p = torch.softmax(scores_chw, dim=0)
     return -(p * (p + eps).log()).sum(dim=0)
 
 def anomaly_maxlogit(scores_chw):
