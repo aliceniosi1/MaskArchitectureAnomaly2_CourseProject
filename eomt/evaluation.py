@@ -1,19 +1,25 @@
-import os, glob, random, sys, hashlib
-from argparse import ArgumentParser
+# Copyright (c) OpenMMLab. All rights reserved.
+import os
+import glob
+import random
+import sys
 
+import cv2  # non usato direttamente, ma lo lasciamo per uniformità
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from torchvision.transforms import Compose, Resize, ToTensor
+from argparse import ArgumentParser
 from sklearn.metrics import average_precision_score, roc_curve
+from torchvision.transforms import Compose, Resize, ToTensor
 
 # -----------------------------------------------------------------------------
-# IMPORT EoMT
+# IMPORT EoMT (aggiungiamo la cartella eomt al PYTHONPATH)
 # -----------------------------------------------------------------------------
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+PROJECT_ROOT = os.path.join(CURRENT_DIR, "..")
 EOMT_ROOT = os.path.join(PROJECT_ROOT, "eomt")
+
 if EOMT_ROOT not in sys.path:
     sys.path.insert(0, EOMT_ROOT)
 
@@ -22,76 +28,86 @@ from models.eomt import EoMT
 from training.lightning_module import LightningModule
 
 # -----------------------------------------------------------------------------
-# Utils (come i tuoi)
+# CONFIG DI BASE (coerente con CityscapesSemantic / EoMT base_640)
 # -----------------------------------------------------------------------------
-def try_paths(candidates):
-    for p in candidates:
-        if p and os.path.exists(p):
-            return p
-    return None
+seed = 42
 
-def infer_gt_path(img_path: str) -> str:
-    base = img_path.replace(os.sep + "images" + os.sep, os.sep + "labels_masks" + os.sep)
-    candidates = [
-        base,
-        os.path.splitext(base)[0] + ".png",
-        os.path.splitext(base)[0] + ".jpg",
-        os.path.splitext(base)[0] + ".jpeg",
-        os.path.splitext(base)[0] + ".webp",
+# general reproducibility
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+
+NUM_CLASSES = 19              # Cityscapes train IDs
+IMG_SIZE = (1024, 1024)       # img_size usato nel data module CityscapesSemantic
+NUM_QUERIES = 100
+NUM_BLOCKS = 3
+BACKBONE_NAME = "vit_base_patch14_reg4_dinov2"
+
+# gpu training specific
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = True
+
+input_transform = Compose(
+    [
+        Resize(IMG_SIZE, Image.BILINEAR),
+        ToTensor(),
     ]
-    gt = try_paths(candidates)
-    if gt is None:
-        raise FileNotFoundError(f"GT not found for image: {img_path}\nTried:\n" + "\n".join(candidates))
-    return gt
+)
 
-def build_ood_gt(gt_path: str, img_size, target_transform) -> np.ndarray:
-    mask = Image.open(gt_path)
-    mask = target_transform(mask)
-    ood_gts = np.array(mask)
-    p = gt_path.lower()
-
-    if ("roadanomaly" in p) and ("roadanomaly21" not in p):
-        ood_gts = np.where(ood_gts == 2, 1, 0).astype(np.uint8)
-
-    elif ("roadanomaly21" in p) or ("roadobsticle21" in p) or ("roadobstacle21" in p) or ("fs_static" in p) or ("fs_lostfound_full" in p):
-        ignore = (ood_gts == 255)
-        ood_gts = np.where(ignore, 255, np.where(ood_gts == 1, 1, 0)).astype(np.uint8)
-
-    else:
-        ignore = (ood_gts == 255)
-        ood_gts = np.where(ignore, 255, np.where(ood_gts == 1, 1, 0)).astype(np.uint8)
-
-    # img_size = (H,W); numpy is (H,W); PIL resize uses (W,H) ma qui hai già fatto Resize giusto
-    if ood_gts.shape[0] != img_size[0] or ood_gts.shape[1] != img_size[1]:
-        raise ValueError(f"GT size mismatch. Got {ood_gts.shape}, expected (H,W)=({img_size[0]},{img_size[1]}) for {gt_path}")
-
-    return ood_gts
+target_transform = Compose(
+    [
+        Resize(IMG_SIZE, Image.NEAREST),
+    ]
+)
 
 # -----------------------------------------------------------------------------
-# Model loader (come il tuo)
+# METRICA FPR@95TPR (al posto di ood_metrics.fpr_at_95_tpr)
 # -----------------------------------------------------------------------------
-def load_eomt_model(
-    ckpt_path: str,
-    device: torch.device,
-    img_size=(1024, 1024),
-    num_classes=19,
-    num_queries=100,
-    num_blocks=3,
-    backbone_name="vit_base_patch14_reg4_dinov2",
-) -> EoMT:
-    encoder = ViT(img_size=img_size, backbone_name=backbone_name)
+def fpr_at_95_tpr(scores: np.ndarray, labels: np.ndarray) -> float:
+    """
+    Calcola FPR@95%TPR dato un vettore di punteggi 'scores'
+    e un vettore di label binarie 'labels' (1 = OOD, 0 = in-distribution).
+    """
+    fpr, tpr, _ = roc_curve(labels, scores, pos_label=1)
+
+    # indici dove TPR >= 0.95
+    idxs = np.where(tpr >= 0.95)[0]
+    if len(idxs) == 0:
+        # se non raggiungiamo mai 95% di TPR, restituiamo FPR massimo
+        return 1.0
+
+    # primo threshold che raggiunge almeno 95% TPR
+    return float(fpr[idxs[0]])
+
+
+# -----------------------------------------------------------------------------
+# COSTRUZIONE E CARICAMENTO DEL MODELLO EoMT
+# -----------------------------------------------------------------------------
+def load_eomt_model(ckpt_path: str, device: torch.device) -> EoMT:
+    """
+    Costruisce il backbone ViT + EoMT e carica i pesi da un checkpoint
+    tramite la LightningModule del progetto.
+    """
+    # Encoder DINOv2
+    encoder = ViT(
+        img_size=IMG_SIZE,
+        backbone_name=BACKBONE_NAME,
+    )
+
+    # Rete EoMT
     network = EoMT(
         encoder=encoder,
-        num_classes=num_classes,
-        num_q=num_queries,
-        num_blocks=num_blocks,
+        num_classes=NUM_CLASSES,
+        num_q=NUM_QUERIES,
+        num_blocks=NUM_BLOCKS,
         masked_attn_enabled=True,
     )
 
+    # Usiamo LightningModule solo per caricare comodamente il checkpoint
     lm = LightningModule(
         network=network,
-        img_size=img_size,
-        num_classes=num_classes,
+        img_size=IMG_SIZE,
+        num_classes=NUM_CLASSES,
         attn_mask_annealing_enabled=False,
         attn_mask_annealing_start_steps=None,
         attn_mask_annealing_end_steps=None,
@@ -108,212 +124,192 @@ def load_eomt_model(
     )
 
     model = lm.network
-    model.to(device).eval()
+    model.to(device)
+    model.eval()
     return model
 
-# -----------------------------------------------------------------------------
-# Combine + anomaly scores
-# -----------------------------------------------------------------------------
-def combine_to_per_pixel_scores(mask_logits_raw, class_logits, out_hw):
-    """
-    mask_logits_raw: (Q, h, w)   logits
-    class_logits:    (Q, C+1)    logits
-    out_hw: (H,W)
-
-    returns scores: (C, H, W) non-negative "class score maps"
-    """
-    # upsample mask logits to (H,W)
-    mask = F.interpolate(mask_logits_raw[None, ...], size=out_hw, mode="bilinear", align_corners=False)[0]  # (Q,H,W)
-
-    # mask probs and class probs
-    mask_p = mask.sigmoid()  # (Q,H,W)
-    cls_p = class_logits.softmax(dim=-1)[..., :-1]  # (Q,C) (drop "no object")
-
-    # scores_c(h,w) = sum_q mask_p(q,h,w) * cls_p(q,c)
-    scores = torch.einsum("qhw,qc->chw", mask_p, cls_p)  # (C,H,W)
-    return scores
-
-def anomaly_msp(scores_chw, eps=1e-12):
-    """MSP anomaly score computed from per-pixel class *logits*.
-
-    In the official notebook flow, MSP is defined as:
-        score = 1 - max_c softmax(logits)_c
-
-    Here `scores_chw` is the per-pixel class score map produced by the
-    MaskFormer-style combination of mask and class predictions.
-    We treat it as logits and apply a Softmax across classes.
-    """
-    p = torch.softmax(scores_chw, dim=0)
-    return 1.0 - p.max(dim=0).values  # (H,W)
-
-def anomaly_maxentropy(scores_chw, eps=1e-12):
-    """MaxEntropy anomaly score.
-
-    Defined as the entropy of the Softmax probabilities:
-        score = - sum_c p_c log(p_c),   p = softmax(logits)
-
-    Higher entropy => more uncertainty => more likely OOD.
-    """
-    p = torch.softmax(scores_chw, dim=0)
-    return -(p * (p + eps).log()).sum(dim=0)
-
-def anomaly_maxlogit(scores_chw):
-    # "logit" qui non è un logit puro: è un class-score map; lo uso come proxy
-    return -scores_chw.max(dim=0).values
 
 # -----------------------------------------------------------------------------
-# Metrics (AuPRC e FPR@95)
+# FUNZIONE PER CALCOLARE LA MAPPA DI ANOMALIA
 # -----------------------------------------------------------------------------
-def auprc_sklearn(y_true: np.ndarray, scores: np.ndarray) -> float:
-    """AUPRC using sklearn (matches many reference eval scripts)."""
-    y_true = (y_true > 0).astype(np.uint8)
-    if y_true.sum() == 0:
-        return float("nan")
-    return float(average_precision_score(y_true, scores))
-
-
-def fpr_at_95_tpr_roc(scores: np.ndarray, labels: np.ndarray) -> float:
-    """FPR@95%TPR computed from the ROC curve (matches reference script).
-
-    `labels`: 1 = OOD, 0 = IND
-    `scores`: higher => more OOD
+def compute_anomaly_map_from_logits(logits: torch.Tensor, method: str) -> torch.Tensor:
     """
-    labels = (labels > 0).astype(np.uint8)
-    fpr, tpr, _ = roc_curve(labels, scores, pos_label=1)
-    idxs = np.where(tpr >= 0.95)[0]
-    if len(idxs) == 0:
-        return 1.0
-    return float(fpr[idxs[0]])
+    logits: Tensor [C, H, W]
+    method: 'msp' | 'maxlogit' | 'maxentropy' | 'rba'
+    ritorna una mappa [H, W] dove valori alti = più anomalo
+    """
+    probs = F.softmax(logits, dim=0)  # softmax sui canali C
 
-def flatten_valid(score_hw: torch.Tensor, gt_hw: np.ndarray):
-    """
-    gt_hw: np array (H,W) in {0,1,255}
-    """
-    gt = gt_hw.reshape(-1)
-    score = score_hw.detach().cpu().reshape(-1).numpy().astype(np.float64)
-    valid = gt != 255
-    return score[valid], gt[valid].astype(np.uint8)
+    if method == "msp":
+        # Maximum Softmax Probability → anomalia = 1 - MSP
+        msp = probs.max(dim=0).values
+        anomaly = 1.0 - msp
+    elif method == "maxlogit":
+        # anomalia alta quando il logit massimo è basso
+        maxlogit = logits.max(dim=0).values
+        anomaly = -maxlogit
+    elif method == "maxentropy":
+        eps = 1e-8
+        entropy = -(probs * (probs + eps).log()).sum(dim=0)
+        anomaly = entropy
+    elif method == "rba":
+        # Versione semplificata stile “reject-based”:
+        # pixel con MSP sotto soglia → più anomali
+        msp = probs.max(dim=0).values
+        accept_threshold = 0.5
+        anomaly = torch.clamp(accept_threshold - msp, min=0) / accept_threshold
+    else:
+        raise ValueError(f"Unknown method: {method}")
+
+    return anomaly
+
 
 # -----------------------------------------------------------------------------
-# Main
+# MAIN
 # -----------------------------------------------------------------------------
 def main():
     parser = ArgumentParser()
-    parser.add_argument("--input", nargs="+", required=True,
-                        help="Glob pattern for images, e.g. '/path/RoadAnomaly/images/*.jpg'")
-    parser.add_argument("--loadDir", default="../trained_models/")
-    parser.add_argument("--loadWeights", default="eomt_cityscapes.bin")
-    parser.add_argument("--img_size", default="1024,1024",
-                        help="Model/GT size as 'H,W' (default 1024,1024).")
-    parser.add_argument("--cpu", action="store_true")
-    parser.add_argument("--max_images", type=int, default=-1)
     parser.add_argument(
-        "--skip_no_ood",
-        action="store_true",
-        help="Skip images that contain no OOD pixels (matches some reference eval scripts).",
+        "--input",
+        default="/home/shyam/Mask2Former/unk-eval/RoadObsticle21/images/*.webp",
+        nargs="+",
+        help="A list of space separated input images; "
+        "or a single glob pattern such as 'directory/*.jpg'",
     )
+    parser.add_argument("--loadDir", default="../trained_models/")
+    parser.add_argument(
+        "--loadWeights",
+        default="eomt_cityscapes.bin",  # nome del file di pesi EoMT
+        help="Checkpoint EoMT pre-addestrato su Cityscapes",
+    )
+    parser.add_argument(
+        "--method",
+        default="msp",
+        choices=["msp", "maxlogit", "maxentropy", "rba"],
+        help="Metodo per generare la mappa di anomalia",
+    )
+    parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()
 
-    seed = 42
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    anomaly_score_list = []
+    ood_gts_list = []
 
-    H, W = [int(x.strip()) for x in args.img_size.split(",")]
-    IMG_SIZE = (H, W)
-    PIL_SIZE = (W, H)
-
-    input_transform = Compose([Resize(PIL_SIZE, Image.BILINEAR), ToTensor()])
-    target_transform = Compose([Resize(PIL_SIZE, Image.NEAREST)])
-
+    # Device
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
 
+    if not os.path.exists("results.txt"):
+        open("results.txt", "w").close()
+    file = open("results.txt", "a")
+
     ckpt_path = os.path.join(args.loadDir, args.loadWeights)
+
     print("Loading EoMT checkpoint:", ckpt_path)
-    model = load_eomt_model(ckpt_path, device, img_size=IMG_SIZE)
+    model = load_eomt_model(ckpt_path, device)
+    print("Model LOADED successfully (EoMT + DINOv2)")
+    model.eval()
 
-    # Build list of image paths
-    img_paths = []
-    for pat in args.input:
-        img_paths.extend(glob.glob(os.path.expanduser(str(pat))))
-    img_paths = sorted(list(set(img_paths)))
-    if not img_paths:
-        raise FileNotFoundError(f"No images matched input: {args.input}")
-    if args.max_images > 0:
-        img_paths = img_paths[: args.max_images]
+    # -------------------------------------------------------------------------
+    # LOOP sulle immagini
+    # -------------------------------------------------------------------------
+    for path in glob.glob(os.path.expanduser(str(args.input[0]))):
+        print(path)
 
-    # Accumulators
-    all_gt = []
-    all_msp = []
-    all_ent = []
-    all_mlog = []
+        # Immagine → tensor [1, 3, H, W]
+        img_pil = Image.open(path).convert("RGB")
+        images = input_transform(img_pil).unsqueeze(0).float().to(device)
 
-    errors = 0
+        with torch.no_grad():
+            # EoMT ritorna liste per-layer
+            mask_logits_per_layer, class_logits_per_layer = model(images)
 
-    for idx, path in enumerate(img_paths, 1):
-        try:
-            gt_path = infer_gt_path(path)
-            ood_gts = build_ood_gt(gt_path, IMG_SIZE, target_transform)  # (H,W) in {0,1,255}
+            # Usiamo SOLO l'ultimo layer (come in training)
+            mask_logits = mask_logits_per_layer[-1]      # [B, Q, h, w]
+            class_logits = class_logits_per_layer[-1]    # [B, Q, C+1]
 
-            img_pil = Image.open(path).convert("RGB")
-            images = input_transform(img_pil).unsqueeze(0).float().to(device)
+            # Ridimensioniamo le mask alla risoluzione target (IMG_SIZE)
+            mask_logits = F.interpolate(
+                mask_logits, size=IMG_SIZE, mode="bilinear", align_corners=False
+            )
 
-            with torch.no_grad():
-                mask_logits_per_layer, class_logits_per_layer = model(images)
-                mask_logits_raw = mask_logits_per_layer[-1][0]     # (Q,h,w)
-                class_logits     = class_logits_per_layer[-1][0]   # (Q,C+1)
+            # Logits per pixel [B, C, H, W]
+            per_pixel_logits = LightningModule.to_per_pixel_logits_semantic(
+                mask_logits, class_logits
+            )
+            logits = per_pixel_logits[0]  # [C, H, W]
 
-                scores_chw = combine_to_per_pixel_scores(mask_logits_raw, class_logits, out_hw=IMG_SIZE)  # (C,H,W)
+            # Mappa di anomalia [H, W]
+            anomaly_tensor = compute_anomaly_map_from_logits(logits, args.method)
+            anomaly_result = anomaly_tensor.detach().cpu().numpy()
 
-                msp  = anomaly_msp(scores_chw)
-                ment = anomaly_maxentropy(scores_chw)
-                mlog = anomaly_maxlogit(scores_chw)
+        # ---------------------------------------------------------------------
+        # Ground truth OOD (stesso codice dell'eval ERFNet)
+        # ---------------------------------------------------------------------
+        pathGT = path.replace("images", "labels_masks")
+        if "RoadObsticle21" in pathGT:
+            pathGT = pathGT.replace("webp", "png")
+        if "fs_static" in pathGT:
+            pathGT = pathGT.replace("jpg", "png")
+        if "RoadAnomaly" in pathGT:
+            pathGT = pathGT.replace("jpg", "png")
 
-            msp_s,  gt_v = flatten_valid(msp,  ood_gts)
+        mask = Image.open(pathGT)
+        mask = target_transform(mask)
+        ood_gts = np.array(mask)
 
-            # Optional: mimic reference scripts that skip images with no OOD pixels
-            if args.skip_no_ood and (gt_v == 1).sum() == 0:
-                continue
+        if "RoadAnomaly" in pathGT:
+            ood_gts = np.where((ood_gts == 2), 1, ood_gts)
+        if "LostAndFound" in pathGT:
+            ood_gts = np.where((ood_gts == 0), 255, ood_gts)
+            ood_gts = np.where((ood_gts == 1), 0, ood_gts)
+            ood_gts = np.where((ood_gts > 1) & (ood_gts < 201), 1, ood_gts)
 
-            ent_s,  _    = flatten_valid(ment, ood_gts)
-            mlog_s, _    = flatten_valid(mlog, ood_gts)
+        if "Streethazard" in pathGT:
+            ood_gts = np.where((ood_gts == 14), 255, ood_gts)
+            ood_gts = np.where((ood_gts < 20), 0, ood_gts)
+            ood_gts = np.where((ood_gts == 255), 1, ood_gts)
 
-            all_gt.append(gt_v)
-            all_msp.append(msp_s)
-            all_ent.append(ent_s)
-            all_mlog.append(mlog_s)
+        # Skippa immagini senza pixel OOD
+        if 1 not in np.unique(ood_gts):
+            continue
+        else:
+            ood_gts_list.append(ood_gts)
+            anomaly_score_list.append(anomaly_result)
 
-            if idx % 10 == 0:
-                print(f"[{idx}/{len(img_paths)}] ok (errors={errors})")
+        del mask, ood_gts, anomaly_result, logits, per_pixel_logits
+        torch.cuda.empty_cache()
 
-            del images
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+    file.write("\n")
 
-        except Exception as e:
-            errors += 1
-            print(f"ERROR on {path}: {e}")
+    # -------------------------------------------------------------------------
+    # Calcolo metriche (identico allo script ERFNet)
+    # -------------------------------------------------------------------------
+    ood_gts = np.array(ood_gts_list)
+    anomaly_scores = np.array(anomaly_score_list)
 
-    # Dataset-level metrics
-    y = np.concatenate(all_gt, axis=0)
-    msp_scores  = np.concatenate(all_msp, axis=0)
-    ent_scores  = np.concatenate(all_ent, axis=0)
-    mlog_scores = np.concatenate(all_mlog, axis=0)
+    ood_mask = ood_gts == 1
+    ind_mask = ood_gts == 0
 
-    msp_auprc  = auprc_sklearn(y, msp_scores) * 100.0
-    msp_fpr95  = fpr_at_95_tpr_roc(msp_scores, y) * 100.0
-    ent_auprc  = auprc_sklearn(y, ent_scores) * 100.0
-    ent_fpr95  = fpr_at_95_tpr_roc(ent_scores, y) * 100.0
-    mlog_auprc = auprc_sklearn(y, mlog_scores) * 100.0
-    mlog_fpr95 = fpr_at_95_tpr_roc(mlog_scores, y) * 100.0
+    ood_out = anomaly_scores[ood_mask]
+    ind_out = anomaly_scores[ind_mask]
 
-    print("\n=== RESULTS ===")
-    print(f"{'Method':<12} | {'AuPRC (%)':>10} | {'FPR@95 (%)':>10}")
-    print("-" * 40)
-    print(f"{'MSP':<12} | {msp_auprc:10.2f} | {msp_fpr95:10.2f}")
-    print(f"{'MaxLogit':<12} | {mlog_auprc:10.2f} | {mlog_fpr95:10.2f}")
-    print(f"{'MaxEntropy':<12} | {ent_auprc:10.2f} | {ent_fpr95:10.2f}")
-    print(f"\nErrors: {errors} / {len(img_paths)}")
+    ood_label = np.ones(len(ood_out))
+    ind_label = np.zeros(len(ind_out))
+
+    val_out = np.concatenate((ind_out, ood_out))
+    val_label = np.concatenate((ind_label, ood_label))
+
+    prc_auc = average_precision_score(val_label, val_out)
+    fpr = fpr_at_95_tpr(val_out, val_label)
+
+    print(f"[EoMT-{args.method}] AUPRC score: {prc_auc * 100.0}")
+    print(f"[EoMT-{args.method}] FPR@TPR95: {fpr * 100.0}")
+
+    file.write(
+        f"    [EoMT-{args.method}] AUPRC score:{prc_auc * 100.0}"
+        f"   FPR@TPR95:{fpr * 100.0}"
+    )
+    file.close()
+
 
 if __name__ == "__main__":
     main()
