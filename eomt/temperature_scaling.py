@@ -194,29 +194,20 @@ def per_pixel_scores_with_temperature(
 
 
 # -----------------------------------------------------------------------------
-# Anomaly maps (from per-pixel class score maps)
+# MSP-only anomaly map function
 # -----------------------------------------------------------------------------
 @torch.no_grad()
-def anomaly_map_from_pixel_scores(pixel_scores_chw: torch.Tensor, method: str) -> torch.Tensor:
-    """
+def anomaly_msp_from_pixel_scores(pixel_scores_chw: torch.Tensor) -> torch.Tensor:
+    """\
     pixel_scores_chw: [C,H,W]
-    returns: [H,W] (più alto => più OOD)
+    returns: [H,W] MSP anomaly score (higher => more OOD)
+
+    MSP anomaly score = 1 - max_c softmax(pixel_scores)_c
+    NOTE: pixel_scores are non-negative class score maps (from mask-class combination).
+    We apply softmax across classes to obtain a per-pixel distribution.
     """
-    if method == "maxlogit":
-        # NOTE: qui "logit" è in realtà uno score map, ma teniamo la definizione per coerenza col tuo eval
-        return -pixel_scores_chw.max(dim=0).values
-
-    # MSP / Entropy richiedono una distribuzione: facciamo softmax sui C
     probs = torch.softmax(pixel_scores_chw, dim=0)
-
-    if method == "msp":
-        return 1.0 - probs.max(dim=0).values
-
-    if method == "maxentropy":
-        eps = 1e-8
-        return -(probs * (probs + eps).log()).sum(dim=0)
-
-    raise ValueError(f"Unknown method: {method}")
+    return 1.0 - probs.max(dim=0).values
 
 
 # -----------------------------------------------------------------------------
@@ -230,8 +221,6 @@ def main():
     parser.add_argument("--loadWeights", default="eomt_cityscapes.bin")
     parser.add_argument("--temperatures", nargs="+", type=float, required=True,
                         help="Lista di T, es: 0.5 0.75 1.0 1.5 2.0")
-    parser.add_argument("--methods", nargs="+", default=["msp", "maxentropy", "maxlogit"],
-                        choices=["msp", "maxentropy", "maxlogit"])
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--max_images", type=int, default=-1,
                         help="Per debug. -1 = tutte.")
@@ -257,11 +246,10 @@ def main():
         img_paths = img_paths[: args.max_images]
 
     temps = [float(t) for t in args.temperatures]
-    methods = args.methods
 
-    # Accumulator: scores[method][T] -> {"ood": [np arrays], "ind": [np arrays]}
-    scores: Dict[str, Dict[float, Dict[str, List[np.ndarray]]]] = {
-        m: {t: {"ood": [], "ind": []} for t in temps} for m in methods
+    # Accumulator (MSP only): scores[T] -> {"ood": [np arrays], "ind": [np arrays]}
+    scores: Dict[float, Dict[str, List[np.ndarray]]] = {
+        t: {"ood": [], "ind": []} for t in temps
     }
 
     processed = 0
@@ -294,10 +282,6 @@ def main():
                     mask_logits, size=IMG_SIZE, mode="bilinear", align_corners=False
                 )
 
-                # Precompute mask_probs once
-                # (We compute per_pixel_scores_with_temperature which does sigmoid internally;
-                # leaving it inside keeps it simple. If vuoi, si può ottimizzare.)
-
                 for T in temps:
                     pixel_scores_bchw = per_pixel_scores_with_temperature(
                         mask_logits=mask_logits,
@@ -306,12 +290,11 @@ def main():
                     )
                     pixel_scores = pixel_scores_bchw[0]  # [C,H,W]
 
-                    for m in methods:
-                        amap = anomaly_map_from_pixel_scores(pixel_scores, m)  # [H,W]
-                        amap_np = amap.detach().cpu().numpy().astype(np.float32)
+                    amap = anomaly_msp_from_pixel_scores(pixel_scores)  # [H,W]
+                    amap_np = amap.detach().cpu().numpy().astype(np.float32)
 
-                        scores[m][T]["ood"].append(amap_np[ood_mask])
-                        scores[m][T]["ind"].append(amap_np[ind_mask])
+                    scores[T]["ood"].append(amap_np[ood_mask])
+                    scores[T]["ind"].append(amap_np[ind_mask])
 
             processed += 1
 
@@ -336,31 +319,41 @@ def main():
     # -------------------------------------------------------------------------
     # Compute metrics and print tables
     # -------------------------------------------------------------------------
-    for m in methods:
-        print(f"\n=== RESULTS (method={m}) ===")
-        print("Temp     |  AuPRC (%) | FPR@95 (%)")
-        print("-----------------------------------")
-        for T in temps:
-            ood_list = scores[m][T]["ood"]
-            ind_list = scores[m][T]["ind"]
+    print("\n=== RESULTS (MSP with Temperature Scaling) ===")
+    print("Temp     |  AuPRC (%) | FPR@95 (%)")
+    print("-----------------------------------")
 
-            if len(ood_list) == 0 or len(ind_list) == 0:
-                print(f"{T:<8.3f} |    (no data) |   (no data)")
-                continue
+    best_T = None
+    best_auprc = -1.0
 
-            ood_out = np.concatenate(ood_list, axis=0)
-            ind_out = np.concatenate(ind_list, axis=0)
+    for T in temps:
+        ood_list = scores[T]["ood"]
+        ind_list = scores[T]["ind"]
 
-            val_out = np.concatenate((ind_out, ood_out), axis=0)
-            val_label = np.concatenate(
-                (np.zeros_like(ind_out, dtype=np.uint8), np.ones_like(ood_out, dtype=np.uint8)),
-                axis=0
-            )
+        if len(ood_list) == 0 or len(ind_list) == 0:
+            print(f"{T:<8.3f} |    (no data) |   (no data)")
+            continue
 
-            prc_auc = average_precision_score(val_label, val_out) * 100.0
-            fpr95 = fpr_at_95_tpr(val_out, val_label) * 100.0
+        ood_out = np.concatenate(ood_list, axis=0)
+        ind_out = np.concatenate(ind_list, axis=0)
 
-            print(f"{T:<8.3f} | {prc_auc:10.2f} | {fpr95:9.2f}")
+        val_out = np.concatenate((ind_out, ood_out), axis=0)
+        val_label = np.concatenate(
+            (np.zeros_like(ind_out, dtype=np.uint8), np.ones_like(ood_out, dtype=np.uint8)),
+            axis=0
+        )
+
+        prc_auc = average_precision_score(val_label, val_out) * 100.0
+        fpr95 = fpr_at_95_tpr(val_out, val_label) * 100.0
+
+        if prc_auc > best_auprc:
+            best_auprc = prc_auc
+            best_T = T
+
+        print(f"{T:<8.3f} | {prc_auc:10.2f} | {fpr95:9.2f}")
+
+    if best_T is not None:
+        print(f"\nBest T by AuPRC: T={best_T} (AuPRC={best_auprc:.2f}%)")
 
 
 if __name__ == "__main__":
