@@ -41,6 +41,9 @@ class MaskClassificationSemantic(LightningModule):
         ckpt_path: Optional[str] = None,
         delta_weights: bool = False,
         load_ckpt_class_head: bool = True,
+        finetune_strategy: str = "last_n_blocks",
+        unfreeze_backbone_blocks: int = 4,
+        unfreeze_backbone_norm: bool = True,
     ):
         super().__init__(
             network=network,
@@ -59,6 +62,9 @@ class MaskClassificationSemantic(LightningModule):
             ckpt_path=ckpt_path,
             delta_weights=delta_weights,
             load_ckpt_class_head=load_ckpt_class_head,
+            finetune_strategy=finetune_strategy,
+            unfreeze_backbone_blocks=unfreeze_backbone_blocks,
+            unfreeze_backbone_norm=unfreeze_backbone_norm,
         )
 
         self.save_hyperparameters(ignore=["_class_path"])

@@ -127,7 +127,9 @@ class LightningModule(lightning.LightningModule):
 
         # Guard: if the network does not have the expected structure
         if not hasattr(self.network, "encoder") or not hasattr(self.network.encoder, "backbone"):
-            logging.warning("Finetune policy requested, but network.encoder.backbone not found. Skipping freeze/unfreeze.")
+            logging.warning(
+                "Finetune policy requested, but network.encoder.backbone not found. Skipping freeze/unfreeze."
+            )
             return
 
         backbone = self.network.encoder.backbone
@@ -148,14 +150,20 @@ class LightningModule(lightning.LightningModule):
             if hasattr(backbone, "blocks") and isinstance(backbone.blocks, (list, nn.ModuleList)):
                 total_blocks = len(backbone.blocks)
                 if n <= 0:
-                    logging.info("Finetune strategy: last_n_blocks with n<=0 -> equivalent to heads_only (backbone frozen)")
+                    logging.info(
+                        "Finetune strategy: last_n_blocks with n<=0 -> equivalent to heads_only (backbone frozen)"
+                    )
                 else:
                     start = max(0, total_blocks - n)
                     for i in range(start, total_blocks):
                         self._set_requires_grad(backbone.blocks[i], True)
-                    logging.info(f"Finetune strategy: last_n_blocks (unfroze blocks [{start}:{total_blocks}] out of {total_blocks})")
+                    logging.info(
+                        f"Finetune strategy: last_n_blocks (unfroze blocks [{start}:{total_blocks}] out of {total_blocks})"
+                    )
             else:
-                logging.warning("Finetune strategy last_n_blocks requested, but backbone.blocks not found. Backbone remains frozen.")
+                logging.warning(
+                    "Finetune strategy last_n_blocks requested, but backbone.blocks not found. Backbone remains frozen."
+                )
 
             # Optionally unfreeze final norm layers (common names: norm, fc_norm)
             if bool(self.unfreeze_backbone_norm):
@@ -166,7 +174,9 @@ class LightningModule(lightning.LightningModule):
 
             return
 
-        logging.warning(f"Unknown finetune_strategy='{self.finetune_strategy}'. No freezing applied.")
+        logging.warning(
+            f"Unknown finetune_strategy='{self.finetune_strategy}'. No freezing applied."
+        )
 
     def configure_optimizers(self):
         encoder_param_names = {
