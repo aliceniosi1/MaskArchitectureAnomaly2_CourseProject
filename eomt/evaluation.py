@@ -311,8 +311,8 @@ def main():
     print(f"{'Method':<12} | {'AuPRC (%)':>10} | {'FPR@95 (%)':>10}")
     print("-" * 40)
     print(f"{'MSP':<12} | {msp_auprc:10.2f} | {msp_fpr95:10.2f}")
-    print(f"{'MaxEntropy':<12} | {ent_auprc:10.2f} | {ent_fpr95:10.2f}")
     print(f"{'MaxLogit':<12} | {mlog_auprc:10.2f} | {mlog_fpr95:10.2f}")
+    print(f"{'MaxEntropy':<12} | {ent_auprc:10.2f} | {ent_fpr95:10.2f}")
     print(f"\nErrors: {errors} / {len(img_paths)}")
 
 if __name__ == "__main__":
