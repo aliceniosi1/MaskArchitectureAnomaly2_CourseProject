@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torchvision.transforms import Compose, Resize, ToTensor
+from sklearn.metrics import average_precision_score, roc_curve
 
 # -----------------------------------------------------------------------------
 # IMPORT EoMT
@@ -163,30 +164,26 @@ def anomaly_maxlogit(scores_chw):
 # -----------------------------------------------------------------------------
 # Metrics (AuPRC e FPR@95)
 # -----------------------------------------------------------------------------
-def average_precision(y_true: np.ndarray, scores: np.ndarray) -> float:
+def auprc_sklearn(y_true: np.ndarray, scores: np.ndarray) -> float:
+    """AUPRC using sklearn (matches many reference eval scripts)."""
     y_true = (y_true > 0).astype(np.uint8)
-    pos = int(y_true.sum())
-    if pos == 0:
+    if y_true.sum() == 0:
         return float("nan")
+    return float(average_precision_score(y_true, scores))
 
-    order = np.argsort(-scores)
-    y = y_true[order]
-    tp = np.cumsum(y == 1)
-    fp = np.cumsum(y == 0)
-    precision = tp / np.maximum(tp + fp, 1)
-    recall = tp / pos
-    recall_prev = np.concatenate(([0.0], recall[:-1]))
-    ap = float(np.sum((recall - recall_prev) * precision))
-    return ap
 
-def fpr_at_95_tpr(y_true: np.ndarray, scores: np.ndarray) -> float:
-    y_true = (y_true > 0).astype(np.uint8)
-    pos_scores = scores[y_true == 1]
-    neg_scores = scores[y_true == 0]
-    if pos_scores.size == 0 or neg_scores.size == 0:
-        return float("nan")
-    thr = float(np.quantile(pos_scores, 0.05))  # 95% TPR
-    return float(np.mean(neg_scores >= thr))
+def fpr_at_95_tpr_roc(scores: np.ndarray, labels: np.ndarray) -> float:
+    """FPR@95%TPR computed from the ROC curve (matches reference script).
+
+    `labels`: 1 = OOD, 0 = IND
+    `scores`: higher => more OOD
+    """
+    labels = (labels > 0).astype(np.uint8)
+    fpr, tpr, _ = roc_curve(labels, scores, pos_label=1)
+    idxs = np.where(tpr >= 0.95)[0]
+    if len(idxs) == 0:
+        return 1.0
+    return float(fpr[idxs[0]])
 
 def flatten_valid(score_hw: torch.Tensor, gt_hw: np.ndarray):
     """
@@ -210,6 +207,11 @@ def main():
                         help="Model/GT size as 'H,W' (default 1024,1024).")
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--max_images", type=int, default=-1)
+    parser.add_argument(
+        "--skip_no_ood",
+        action="store_true",
+        help="Skip images that contain no OOD pixels (matches some reference eval scripts).",
+    )
     args = parser.parse_args()
 
     seed = 42
@@ -268,6 +270,11 @@ def main():
                 mlog = anomaly_maxlogit(scores_chw)
 
             msp_s,  gt_v = flatten_valid(msp,  ood_gts)
+
+            # Optional: mimic reference scripts that skip images with no OOD pixels
+            if args.skip_no_ood and (gt_v == 1).sum() == 0:
+                continue
+
             ent_s,  _    = flatten_valid(ment, ood_gts)
             mlog_s, _    = flatten_valid(mlog, ood_gts)
 
@@ -293,12 +300,12 @@ def main():
     ent_scores  = np.concatenate(all_ent, axis=0)
     mlog_scores = np.concatenate(all_mlog, axis=0)
 
-    msp_auprc  = average_precision(y, msp_scores)  * 100.0
-    msp_fpr95  = fpr_at_95_tpr(y, msp_scores)      * 100.0
-    ent_auprc  = average_precision(y, ent_scores)  * 100.0
-    ent_fpr95  = fpr_at_95_tpr(y, ent_scores)      * 100.0
-    mlog_auprc = average_precision(y, mlog_scores) * 100.0
-    mlog_fpr95 = fpr_at_95_tpr(y, mlog_scores)     * 100.0
+    msp_auprc  = auprc_sklearn(y, msp_scores) * 100.0
+    msp_fpr95  = fpr_at_95_tpr_roc(msp_scores, y) * 100.0
+    ent_auprc  = auprc_sklearn(y, ent_scores) * 100.0
+    ent_fpr95  = fpr_at_95_tpr_roc(ent_scores, y) * 100.0
+    mlog_auprc = auprc_sklearn(y, mlog_scores) * 100.0
+    mlog_fpr95 = fpr_at_95_tpr_roc(mlog_scores, y) * 100.0
 
     print("\n=== RESULTS ===")
     print(f"{'Method':<12} | {'AuPRC (%)':>10} | {'FPR@95 (%)':>10}")
