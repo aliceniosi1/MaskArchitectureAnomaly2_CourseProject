@@ -59,6 +59,9 @@ class LightningModule(lightning.LightningModule):
         ckpt_path=None,
         delta_weights=False,
         load_ckpt_class_head=True,
+        finetune_strategy: str = "none",
+        unfreeze_backbone_blocks: int = 0,
+        unfreeze_backbone_norm: bool = True,
     ):
         super().__init__()
 
@@ -75,6 +78,9 @@ class LightningModule(lightning.LightningModule):
         self.poly_power = poly_power
         self.warmup_steps = warmup_steps
         self.llrd_l2_enabled = llrd_l2_enabled
+        self.finetune_strategy = finetune_strategy
+        self.unfreeze_backbone_blocks = unfreeze_backbone_blocks
+        self.unfreeze_backbone_norm = unfreeze_backbone_norm
 
         self.strict_loading = False
 
@@ -97,7 +103,70 @@ class LightningModule(lightning.LightningModule):
             incompatible_keys = self.load_state_dict(ckpt, strict=False)
             self._raise_on_incompatible(incompatible_keys, load_ckpt_class_head)
 
+        self._apply_finetune_freeze_policy()
         self.log = torch.compiler.disable(self.log)  # type: ignore
+
+    def _set_requires_grad(self, module: nn.Module, requires_grad: bool) -> None:
+        for p in module.parameters():
+            p.requires_grad = requires_grad
+
+    def _apply_finetune_freeze_policy(self) -> None:
+        """Freeze/unfreeze parts of the model for fine-tuning.
+
+        Strategies:
+          - "none" / "full": train everything (default)
+          - "heads_only": freeze the entire ViT backbone (encoder.backbone)
+          - "last_n_blocks": freeze backbone then unfreeze last N transformer blocks (+ optional backbone norm)
+        """
+        strategy = (self.finetune_strategy or "none").lower()
+
+        # Nothing to do
+        if strategy in ("none", "full"):
+            logging.info(f"Finetune strategy: {strategy} (train all parameters)")
+            return
+
+        # Guard: if the network does not have the expected structure
+        if not hasattr(self.network, "encoder") or not hasattr(self.network.encoder, "backbone"):
+            logging.warning("Finetune policy requested, but network.encoder.backbone not found. Skipping freeze/unfreeze.")
+            return
+
+        backbone = self.network.encoder.backbone
+
+        if strategy == "heads_only":
+            # Freeze the whole backbone
+            self._set_requires_grad(backbone, False)
+            logging.info("Finetune strategy: heads_only (froze encoder.backbone)")
+            return
+
+        if strategy == "last_n_blocks":
+            n = int(self.unfreeze_backbone_blocks or 0)
+
+            # Freeze the whole backbone first
+            self._set_requires_grad(backbone, False)
+
+            # Unfreeze last N blocks if present
+            if hasattr(backbone, "blocks") and isinstance(backbone.blocks, (list, nn.ModuleList)):
+                total_blocks = len(backbone.blocks)
+                if n <= 0:
+                    logging.info("Finetune strategy: last_n_blocks with n<=0 -> equivalent to heads_only (backbone frozen)")
+                else:
+                    start = max(0, total_blocks - n)
+                    for i in range(start, total_blocks):
+                        self._set_requires_grad(backbone.blocks[i], True)
+                    logging.info(f"Finetune strategy: last_n_blocks (unfroze blocks [{start}:{total_blocks}] out of {total_blocks})")
+            else:
+                logging.warning("Finetune strategy last_n_blocks requested, but backbone.blocks not found. Backbone remains frozen.")
+
+            # Optionally unfreeze final norm layers (common names: norm, fc_norm)
+            if bool(self.unfreeze_backbone_norm):
+                for name, p in backbone.named_parameters():
+                    if name.startswith("norm") or name.startswith("fc_norm"):
+                        p.requires_grad = True
+                logging.info("Also unfroze backbone norm parameters (norm*/fc_norm*)")
+
+            return
+
+        logging.warning(f"Unknown finetune_strategy='{self.finetune_strategy}'. No freezing applied.")
 
     def configure_optimizers(self):
         encoder_param_names = {
@@ -113,6 +182,8 @@ class LightningModule(lightning.LightningModule):
         ).tolist()
 
         for name, param in reversed(list(self.named_parameters())):
+            if not param.requires_grad:
+                continue
             lr = self.lr
 
             if name.replace("network.encoder.backbone.", "") in encoder_param_names:

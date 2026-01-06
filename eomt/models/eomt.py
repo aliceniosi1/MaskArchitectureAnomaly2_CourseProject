@@ -23,12 +23,21 @@ class EoMT(nn.Module):
         num_q,
         num_blocks=4,
         masked_attn_enabled=True,
+        # --- Logit Normalization (LogitNorm) ---
+        logitnorm_enabled: bool = False,
+        logitnorm_tau: float = 0.04,
+        logitnorm_eps: float = 1e-7,
     ):
         super().__init__()
         self.encoder = encoder
         self.num_q = num_q
         self.num_blocks = num_blocks
         self.masked_attn_enabled = masked_attn_enabled
+
+        # LogitNorm hyperparameters
+        self.logitnorm_enabled = bool(logitnorm_enabled)
+        self.logitnorm_tau = float(logitnorm_tau)
+        self.logitnorm_eps = float(logitnorm_eps)
 
         self.register_buffer("attn_mask_probs", torch.ones(num_blocks))
 
@@ -52,10 +61,25 @@ class EoMT(nn.Module):
             *[ScaleBlock(self.encoder.backbone.embed_dim) for _ in range(num_upscale)],
         )
 
+    def _apply_logitnorm(self, logits: torch.Tensor) -> torch.Tensor:
+        """Apply Logit Normalization to logits along the last dimension.
+
+        Expected shape: (..., C) or (..., C+1)
+        Returns: logits / (||logits||_2 * tau)
+
+        If disabled, returns logits unchanged.
+        """
+        if not self.logitnorm_enabled:
+            return logits
+        norm = torch.linalg.vector_norm(logits, ord=2, dim=-1, keepdim=True)
+        norm = norm.clamp_min(self.logitnorm_eps)
+        return logits / (norm * self.logitnorm_tau)
+
     def _predict(self, x: torch.Tensor):
         q = x[:, : self.num_q, :]
 
         class_logits = self.class_head(q)
+        class_logits = self._apply_logitnorm(class_logits)
 
         x = x[:, self.num_q + self.encoder.backbone.num_prefix_tokens :, :]
         x = x.transpose(1, 2).reshape(
