@@ -3,8 +3,9 @@
 # Licensed under the MIT License.
 # ---------------------------------------------------------------
 
-
 from typing import List, Optional
+
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -44,6 +45,10 @@ class MaskClassificationSemantic(LightningModule):
         finetune_strategy: str = "last_n_blocks",
         unfreeze_backbone_blocks: int = 4,
         unfreeze_backbone_norm: bool = True,
+        # --- OOM safety ---
+        # Windowed validation is very memory hungry because it creates many crops.
+        # For Colab, it's often best to disable validation and evaluate later with evaluation.py.
+        skip_windowed_eval: bool = True,
     ):
         super().__init__(
             network=network,
@@ -69,6 +74,8 @@ class MaskClassificationSemantic(LightningModule):
 
         self.save_hyperparameters(ignore=["_class_path"])
 
+        self.skip_windowed_eval = bool(skip_windowed_eval)
+
         self.ignore_idx = ignore_idx
         self.mask_thresh = mask_thresh
         self.overlap_thresh = overlap_thresh
@@ -85,7 +92,10 @@ class MaskClassificationSemantic(LightningModule):
             no_object_coefficient=no_object_coefficient,
         )
 
-        self.init_metrics_semantic(ignore_idx, self.network.num_blocks + 1 if self.network.masked_attn_enabled else 1)
+        self.init_metrics_semantic(
+            ignore_idx,
+            self.network.num_blocks + 1 if self.network.masked_attn_enabled else 1,
+        )
 
     def eval_step(
         self,
@@ -93,6 +103,11 @@ class MaskClassificationSemantic(LightningModule):
         batch_idx=None,
         log_prefix=None,
     ):
+        # Windowed evaluation is extremely memory hungry (many crops per image).
+        # On Colab it can OOM during Lightning's sanity check.
+        if self.skip_windowed_eval or getattr(getattr(self, "trainer", None), "sanity_checking", False):
+            return
+
         imgs, targets = batch
 
         img_sizes = [img.shape[-2:] for img in imgs]
@@ -116,7 +131,11 @@ class MaskClassificationSemantic(LightningModule):
                 )
 
     def on_validation_epoch_end(self):
+        if self.skip_windowed_eval or getattr(getattr(self, "trainer", None), "sanity_checking", False):
+            return
         self._on_eval_epoch_end_semantic("val")
 
     def on_validation_end(self):
+        if self.skip_windowed_eval or getattr(getattr(self, "trainer", None), "sanity_checking", False):
+            return
         self._on_eval_end_semantic("val")
