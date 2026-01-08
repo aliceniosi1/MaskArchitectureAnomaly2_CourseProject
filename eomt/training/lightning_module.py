@@ -62,6 +62,9 @@ class LightningModule(lightning.LightningModule):
         finetune_strategy: str = "none",
         unfreeze_backbone_blocks: int = 0,
         unfreeze_backbone_norm: bool = True,
+        train_miou_enabled: bool = True,
+        train_miou_every_n_steps: int = 200,
+        train_miou_max_size: int = 256,
     ):
         super().__init__()
 
@@ -81,6 +84,9 @@ class LightningModule(lightning.LightningModule):
         self.finetune_strategy = finetune_strategy
         self.unfreeze_backbone_blocks = unfreeze_backbone_blocks
         self.unfreeze_backbone_norm = unfreeze_backbone_norm
+        self.train_miou_enabled = bool(train_miou_enabled)
+        self.train_miou_every_n_steps = int(train_miou_every_n_steps)
+        self.train_miou_max_size = int(train_miou_max_size)
 
         self.strict_loading = False
 
@@ -254,6 +260,11 @@ class LightningModule(lightning.LightningModule):
 
         return self.network(x)
 
+    def on_train_epoch_start(self):
+        # Reset train mIoU each epoch (only when semantic metrics are initialized)
+        if getattr(self, "train_miou_enabled", False) and hasattr(self, "train_miou"):
+            self.train_miou.reset()
+
     def training_step(self, batch, batch_idx):
         imgs, targets = batch
 
@@ -272,10 +283,85 @@ class LightningModule(lightning.LightningModule):
             losses = {f"{key}{block_postfix}": value for key, value in losses.items()}
             losses_all_blocks |= losses
 
-        return self.criterion.loss_total(losses_all_blocks, self.log)
+        loss_total = self.criterion.loss_total(losses_all_blocks, self.log)
+
+        # Log mean loss per epoch (Lightning aggregates when on_epoch=True)
+        self.log(
+            "losses/train_loss_total",
+            loss_total,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=imgs.shape[0],
+        )
+
+        # Lightweight train mIoU monitoring (semantic only), updated every N steps
+        if (
+            getattr(self, "train_miou_enabled", False)
+            and hasattr(self, "train_miou")
+            and hasattr(self, "ignore_idx")
+            and (batch_idx % max(1, int(getattr(self, "train_miou_every_n_steps", 200))) == 0)
+        ):
+            with torch.no_grad():
+                # Use last block outputs
+                mask_logits = mask_logits_per_block[-1]
+                class_logits = class_logits_per_block[-1]
+
+                # Upsample mask logits to training resolution
+                mask_logits = interpolate(
+                    mask_logits,
+                    size=self.img_size,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+                per_pixel_logits = self.to_per_pixel_logits_semantic(mask_logits, class_logits)
+                preds = per_pixel_logits.argmax(dim=1)  # (B,H,W)
+
+                # Build per-pixel GT from instance masks
+                per_pixel_targets = self.to_per_pixel_targets_semantic(targets, self.ignore_idx)
+                gts = torch.stack(per_pixel_targets, dim=0)  # (B,H,W)
+
+                # Align GT to preds if needed
+                if gts.shape[-2:] != preds.shape[-2:]:
+                    gts = interpolate(
+                        gts.float().unsqueeze(1),
+                        size=preds.shape[-2:],
+                        mode="nearest",
+                    ).squeeze(1).long()
+
+                # Downsample for speed if very large
+                ms = int(getattr(self, "train_miou_max_size", 256))
+                if ms > 0 and (preds.shape[-2] > ms or preds.shape[-1] > ms):
+                    preds_ds = interpolate(
+                        preds.float().unsqueeze(1),
+                        size=(ms, ms),
+                        mode="nearest",
+                    ).squeeze(1).long()
+                    gts_ds = interpolate(
+                        gts.float().unsqueeze(1),
+                        size=(ms, ms),
+                        mode="nearest",
+                    ).squeeze(1).long()
+                else:
+                    preds_ds, gts_ds = preds, gts
+
+                self.train_miou.update(preds_ds, gts_ds)
+
+        return loss_total
 
     def validation_step(self, batch, batch_idx=0):
         return self.eval_step(batch, batch_idx, "val")
+
+    def on_train_epoch_end(self):
+        # Log train mIoU at epoch end (only when semantic metrics are initialized)
+        if getattr(self, "train_miou_enabled", False) and hasattr(self, "train_miou"):
+            miou = self.train_miou.compute()
+            self.log("metrics/train_miou", miou, on_step=False, on_epoch=True, prog_bar=True)
+
+            # Also print a readable line
+            if not self.trainer.sanity_checking:
+                rank_zero_info(f"{bold_green}train mIoU: {float(miou) * 100:.2f}{reset}")
 
     def mask_annealing(self, start_iter, current_iter, final_iter):
         device = self.device
@@ -322,6 +408,16 @@ class LightningModule(lightning.LightningModule):
                 )
                 for _ in range(num_blocks)
             ]
+        )
+        # Store ignore index for train-time metrics
+        self.ignore_idx = ignore_idx
+
+        # Dedicated train mIoU (macro average) to monitor learning during fine-tuning
+        self.train_miou = MulticlassJaccardIndex(
+            num_classes=self.num_classes,
+            validate_args=False,
+            ignore_index=ignore_idx,
+            average="macro",
         )
 
     def init_metrics_instance(self, num_blocks):

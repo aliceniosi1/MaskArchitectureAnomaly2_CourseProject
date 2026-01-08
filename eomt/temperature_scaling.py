@@ -264,13 +264,14 @@ def main():
 
             # --- gt ---
             ood_gts = load_ood_gt_from_img_path(path)  # HxW
-            if 1 not in np.unique(ood_gts):
-                skipped_no_ood += 1
-                continue
 
             # Masks
             ood_mask = (ood_gts == 1)
             ind_mask = (ood_gts == 0)
+
+            # Count images without any OOD pixels (we still include them to penalize false positives)
+            if not ood_mask.any():
+                skipped_no_ood += 1
 
             with torch.no_grad():
                 mask_logits_per_layer, class_logits_per_layer = model(images)
@@ -293,8 +294,13 @@ def main():
                     amap = anomaly_msp_from_pixel_scores(pixel_scores)  # [H,W]
                     amap_np = amap.detach().cpu().numpy().astype(np.float32)
 
-                    scores[T]["ood"].append(amap_np[ood_mask])
-                    scores[T]["ind"].append(amap_np[ind_mask])
+                    ood_vals = amap_np[ood_mask]
+                    ind_vals = amap_np[ind_mask]
+
+                    if ood_vals.size > 0:
+                        scores[T]["ood"].append(ood_vals)
+                    if ind_vals.size > 0:
+                        scores[T]["ind"].append(ind_vals)
 
             processed += 1
 
@@ -312,8 +318,8 @@ def main():
 
     print("\n--- DONE FORWARD ---")
     print(f"Images matched:      {len(img_paths)}")
-    print(f"Processed (with OOD):{processed}")
-    print(f"Skipped (no OOD):    {skipped_no_ood}")
+    print(f"Processed:           {processed}")
+    print(f"Images without OOD:  {skipped_no_ood}")
     print(f"Errors:              {errors}")
 
     # -------------------------------------------------------------------------
@@ -330,12 +336,19 @@ def main():
         ood_list = scores[T]["ood"]
         ind_list = scores[T]["ind"]
 
-        if len(ood_list) == 0 or len(ind_list) == 0:
-            print(f"{T:<8.3f} |    (no data) |   (no data)")
+        if len(ind_list) == 0:
+            print(f"{T:<8.3f} |    (no IND)  |   (no IND)")
+            continue
+        if len(ood_list) == 0:
+            print(f"{T:<8.3f} |    (no OOD)  |   (no OOD)")
             continue
 
-        ood_out = np.concatenate(ood_list, axis=0)
         ind_out = np.concatenate(ind_list, axis=0)
+        ood_out = np.concatenate(ood_list, axis=0)
+
+        if ind_out.size == 0 or ood_out.size == 0:
+            print(f"{T:<8.3f} |    (no data) |   (no data)")
+            continue
 
         val_out = np.concatenate((ind_out, ood_out), axis=0)
         val_label = np.concatenate(
