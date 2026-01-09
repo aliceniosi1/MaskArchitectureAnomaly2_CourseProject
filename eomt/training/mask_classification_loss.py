@@ -30,6 +30,10 @@ class MaskClassificationLoss(Mask2FormerLoss):
         class_coefficient: float,
         num_labels: int,
         no_object_coefficient: float,
+        #added for LogitNorm
+        logit_norm_enabled: bool = False,
+        logit_norm_tau: float = 0.04,
+        logit_norm_eps: float = 1e-6,
     ):
         nn.Module.__init__(self)
         self.num_points = num_points
@@ -43,6 +47,9 @@ class MaskClassificationLoss(Mask2FormerLoss):
         empty_weight = torch.ones(self.num_labels + 1)
         empty_weight[-1] = self.eos_coef
         self.register_buffer("empty_weight", empty_weight)
+        self.logit_norm_enabled = logit_norm_enabled
+        self.logit_norm_tau = logit_norm_tau
+        self.logit_norm_eps = logit_norm_eps
 
         self.matcher = Mask2FormerHungarianMatcher(
             num_points=num_points,
@@ -50,7 +57,7 @@ class MaskClassificationLoss(Mask2FormerLoss):
             cost_dice=dice_coefficient,
             cost_class=class_coefficient,
         )
-
+    
     @torch.compiler.disable
     def forward(
         self,
@@ -58,6 +65,12 @@ class MaskClassificationLoss(Mask2FormerLoss):
         targets: List[dict],
         class_queries_logits: Optional[torch.Tensor] = None,
     ):
+        if self.logit_norm_enabled and class_queries_logits is not None:
+            logits_noobj = class_queries_logits[..., :-1]                 # [B, Q, C]
+            norm = logits_noobj.norm(p=2, dim=-1, keepdim=True)  # [B, Q, 1]
+            class_queries_logits = class_queries_logits / (self.logit_norm_tau * (norm + self.logit_norm_eps))
+
+            
         mask_labels = [
             target["masks"].to(masks_queries_logits.dtype) for target in targets
         ]

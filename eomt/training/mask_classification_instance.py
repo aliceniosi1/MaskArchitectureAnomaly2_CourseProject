@@ -45,6 +45,10 @@ class MaskClassificationInstance(LightningModule):
         ckpt_path: Optional[str] = None,
         delta_weights: bool = False,
         load_ckpt_class_head: bool = True,
+        #added for LogitNorm
+        logit_norm_enabled: bool = False,
+        logit_norm_tau: float = 0.04,
+        logit_norm_eps: float = 1e-6,
     ):
         super().__init__(
             network=network,
@@ -81,6 +85,9 @@ class MaskClassificationInstance(LightningModule):
             class_coefficient=class_coefficient,
             num_labels=num_classes,
             no_object_coefficient=no_object_coefficient,
+            logit_norm_enabled=logit_norm_enabled,
+            logit_norm_tau=logit_norm_tau,
+            logit_norm_eps=logit_norm_eps,
         )
 
         self.init_metrics_instance(self.network.num_blocks + 1 if self.network.masked_attn_enabled else 1)
@@ -144,7 +151,7 @@ class MaskClassificationInstance(LightningModule):
                     )
                 )
 
-            self.update_metrics_instance(preds, targets, i)
+            self.update_metrics_instance(preds, targets_, i)
 
     def on_validation_epoch_end(self):
         self._on_eval_epoch_end_instance("val")
