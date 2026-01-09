@@ -115,7 +115,10 @@ class CutPasteOEDataset(torch.utils.data.Dataset):
                 continue
 
             patch_img = TF.resize(patch_img, [new_h, new_w], interpolation=InterpolationMode.BILINEAR)
-            patch_mask = TF.resize(patch_mask.float(), [new_h, new_w], interpolation=InterpolationMode.NEAREST) > 0.5
+            # torchvision v2 resize expects tensor inputs as (..., C, H, W) / (C, H, W). Add a dummy channel for masks.
+            patch_mask = TF.resize(
+                patch_mask[None].float(), [new_h, new_w], interpolation=InterpolationMode.NEAREST
+            )[0] > 0.5
 
             if patch_mask.sum() == 0:
                 continue
