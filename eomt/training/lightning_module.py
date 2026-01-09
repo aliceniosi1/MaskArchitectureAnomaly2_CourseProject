@@ -59,12 +59,7 @@ class LightningModule(lightning.LightningModule):
         ckpt_path=None,
         delta_weights=False,
         load_ckpt_class_head=True,
-        finetune_strategy: str = "none",
-        unfreeze_backbone_blocks: int = 0,
-        unfreeze_backbone_norm: bool = True,
-        train_miou_enabled: bool = True,
-        train_miou_every_n_steps: int = 200,
-        train_miou_max_size: int = 256,
+        train_class_head_only: bool = False,
     ):
         super().__init__()
 
@@ -81,12 +76,9 @@ class LightningModule(lightning.LightningModule):
         self.poly_power = poly_power
         self.warmup_steps = warmup_steps
         self.llrd_l2_enabled = llrd_l2_enabled
-        self.finetune_strategy = finetune_strategy
-        self.unfreeze_backbone_blocks = unfreeze_backbone_blocks
-        self.unfreeze_backbone_norm = unfreeze_backbone_norm
-        self.train_miou_enabled = bool(train_miou_enabled)
-        self.train_miou_every_n_steps = int(train_miou_every_n_steps)
-        self.train_miou_max_size = int(train_miou_max_size)
+
+        # Step-0 finetuning: freeze everything except the classification head
+        self.train_class_head_only = train_class_head_only
 
         self.strict_loading = False
 
@@ -109,82 +101,60 @@ class LightningModule(lightning.LightningModule):
             incompatible_keys = self.load_state_dict(ckpt, strict=False)
             self._raise_on_incompatible(incompatible_keys, load_ckpt_class_head)
 
-        self._apply_finetune_freeze_policy()
+        # Apply freezing AFTER checkpoint loading so weights are loaded first
+        if self.train_class_head_only:
+            self._freeze_all_but_class_head()
+
         self.log = torch.compiler.disable(self.log)  # type: ignore
 
-    def _set_requires_grad(self, module: nn.Module, requires_grad: bool) -> None:
-        for p in module.parameters():
-            p.requires_grad = requires_grad
+    def _freeze_all_but_class_head(self):
+        """Freeze all parameters except the (Cityscapes) class head.
 
-    def _apply_finetune_freeze_policy(self) -> None:
-        """Freeze/unfreeze parts of the model for fine-tuning.
-
-        Strategies:
-          - "none" / "full": train everything (default)
-          - "heads_only": freeze the entire ViT backbone (encoder.backbone)
-          - "last_n_blocks": freeze backbone then unfreeze last N transformer blocks (+ optional backbone norm)
+        This is the intended setup for Step 0 (OE) where we adapt only a tiny
+        number of parameters to avoid catastrophic forgetting.
         """
-        strategy = (self.finetune_strategy or "none").lower()
+        trainable_keys = ("network.class_head", "network.class_predictor")
 
-        # Nothing to do
-        if strategy in ("none", "full"):
-            logging.info(f"Finetune strategy: {strategy} (train all parameters)")
-            return
-
-        # Guard: if the network does not have the expected structure
-        if not hasattr(self.network, "encoder") or not hasattr(self.network.encoder, "backbone"):
-            logging.warning(
-                "Finetune policy requested, but network.encoder.backbone not found. Skipping freeze/unfreeze."
-            )
-            return
-
-        backbone = self.network.encoder.backbone
-
-        if strategy == "heads_only":
-            # Freeze the whole backbone
-            self._set_requires_grad(backbone, False)
-            logging.info("Finetune strategy: heads_only (froze encoder.backbone)")
-            return
-
-        if strategy == "last_n_blocks":
-            n = int(self.unfreeze_backbone_blocks or 0)
-
-            # Freeze the whole backbone first
-            self._set_requires_grad(backbone, False)
-
-            # Unfreeze last N blocks if present
-            if hasattr(backbone, "blocks") and isinstance(backbone.blocks, (list, nn.ModuleList)):
-                total_blocks = len(backbone.blocks)
-                if n <= 0:
-                    logging.info(
-                        "Finetune strategy: last_n_blocks with n<=0 -> equivalent to heads_only (backbone frozen)"
-                    )
-                else:
-                    start = max(0, total_blocks - n)
-                    for i in range(start, total_blocks):
-                        self._set_requires_grad(backbone.blocks[i], True)
-                    logging.info(
-                        f"Finetune strategy: last_n_blocks (unfroze blocks [{start}:{total_blocks}] out of {total_blocks})"
-                    )
+        total, trainable = 0, 0
+        for name, p in self.named_parameters():
+            total += p.numel()
+            if any(k in name for k in trainable_keys):
+                p.requires_grad = True
+                trainable += p.numel()
             else:
-                logging.warning(
-                    "Finetune strategy last_n_blocks requested, but backbone.blocks not found. Backbone remains frozen."
-                )
+                p.requires_grad = False
 
-            # Optionally unfreeze final norm layers (common names: norm, fc_norm)
-            if bool(self.unfreeze_backbone_norm):
-                for name, p in backbone.named_parameters():
-                    if name.startswith("norm") or name.startswith("fc_norm"):
-                        p.requires_grad = True
-                logging.info("Also unfroze backbone norm parameters (norm*/fc_norm*)")
-
-            return
-
-        logging.warning(
-            f"Unknown finetune_strategy='{self.finetune_strategy}'. No freezing applied."
+        logging.info(
+            f"[Step0] train_class_head_only=True -> Trainable params: {trainable:,} / {total:,}"
         )
 
     def configure_optimizers(self):
+        # Step 0: only optimize parameters that require gradients (typically just the class head)
+        if getattr(self, "train_class_head_only", False):
+            trainable_params = [p for p in self.parameters() if p.requires_grad]
+            if len(trainable_params) == 0:
+                raise RuntimeError(
+                    "train_class_head_only=True but no parameters have requires_grad=True"
+                )
+
+            optimizer = AdamW(trainable_params, lr=self.lr, weight_decay=self.weight_decay)
+            scheduler = TwoStageWarmupPolySchedule(
+                optimizer,
+                num_backbone_params=0,
+                warmup_steps=self.warmup_steps,
+                total_steps=self.trainer.estimated_stepping_batches,
+                poly_power=self.poly_power,
+            )
+
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                    "frequency": 1,
+                },
+            }
+
         encoder_param_names = {
             n for n, _ in self.network.encoder.backbone.named_parameters()
         }
@@ -260,11 +230,6 @@ class LightningModule(lightning.LightningModule):
 
         return self.network(x)
 
-    def on_train_epoch_start(self):
-        # Reset train mIoU each epoch (only when semantic metrics are initialized)
-        if getattr(self, "train_miou_enabled", False) and hasattr(self, "train_miou"):
-            self.train_miou.reset()
-
     def training_step(self, batch, batch_idx):
         imgs, targets = batch
 
@@ -283,85 +248,10 @@ class LightningModule(lightning.LightningModule):
             losses = {f"{key}{block_postfix}": value for key, value in losses.items()}
             losses_all_blocks |= losses
 
-        loss_total = self.criterion.loss_total(losses_all_blocks, self.log)
-
-        # Log mean loss per epoch (Lightning aggregates when on_epoch=True)
-        self.log(
-            "losses/train_loss_total",
-            loss_total,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            batch_size=imgs.shape[0],
-        )
-
-        # Lightweight train mIoU monitoring (semantic only), updated every N steps
-        if (
-            getattr(self, "train_miou_enabled", False)
-            and hasattr(self, "train_miou")
-            and hasattr(self, "ignore_idx")
-            and (batch_idx % max(1, int(getattr(self, "train_miou_every_n_steps", 200))) == 0)
-        ):
-            with torch.no_grad():
-                # Use last block outputs
-                mask_logits = mask_logits_per_block[-1]
-                class_logits = class_logits_per_block[-1]
-
-                # Upsample mask logits to training resolution
-                mask_logits = interpolate(
-                    mask_logits,
-                    size=self.img_size,
-                    mode="bilinear",
-                    align_corners=False,
-                )
-
-                per_pixel_logits = self.to_per_pixel_logits_semantic(mask_logits, class_logits)
-                preds = per_pixel_logits.argmax(dim=1)  # (B,H,W)
-
-                # Build per-pixel GT from instance masks
-                per_pixel_targets = self.to_per_pixel_targets_semantic(targets, self.ignore_idx)
-                gts = torch.stack(per_pixel_targets, dim=0)  # (B,H,W)
-
-                # Align GT to preds if needed
-                if gts.shape[-2:] != preds.shape[-2:]:
-                    gts = interpolate(
-                        gts.float().unsqueeze(1),
-                        size=preds.shape[-2:],
-                        mode="nearest",
-                    ).squeeze(1).long()
-
-                # Downsample for speed if very large
-                ms = int(getattr(self, "train_miou_max_size", 256))
-                if ms > 0 and (preds.shape[-2] > ms or preds.shape[-1] > ms):
-                    preds_ds = interpolate(
-                        preds.float().unsqueeze(1),
-                        size=(ms, ms),
-                        mode="nearest",
-                    ).squeeze(1).long()
-                    gts_ds = interpolate(
-                        gts.float().unsqueeze(1),
-                        size=(ms, ms),
-                        mode="nearest",
-                    ).squeeze(1).long()
-                else:
-                    preds_ds, gts_ds = preds, gts
-
-                self.train_miou.update(preds_ds, gts_ds)
-
-        return loss_total
+        return self.criterion.loss_total(losses_all_blocks, self.log)
 
     def validation_step(self, batch, batch_idx=0):
         return self.eval_step(batch, batch_idx, "val")
-
-    def on_train_epoch_end(self):
-        # Log train mIoU at epoch end (only when semantic metrics are initialized)
-        if getattr(self, "train_miou_enabled", False) and hasattr(self, "train_miou"):
-            miou = self.train_miou.compute()
-            self.log("metrics/train_miou", miou, on_step=False, on_epoch=True, prog_bar=True)
-
-            # Also print a readable line
-            if not self.trainer.sanity_checking:
-                rank_zero_info(f"{bold_green}train mIoU: {float(miou) * 100:.2f}{reset}")
 
     def mask_annealing(self, start_iter, current_iter, final_iter):
         device = self.device
@@ -408,16 +298,6 @@ class LightningModule(lightning.LightningModule):
                 )
                 for _ in range(num_blocks)
             ]
-        )
-        # Store ignore index for train-time metrics
-        self.ignore_idx = ignore_idx
-
-        # Dedicated train mIoU (macro average) to monitor learning during fine-tuning
-        self.train_miou = MulticlassJaccardIndex(
-            num_classes=self.num_classes,
-            validate_args=False,
-            ignore_index=ignore_idx,
-            average="macro",
         )
 
     def init_metrics_instance(self, num_blocks):

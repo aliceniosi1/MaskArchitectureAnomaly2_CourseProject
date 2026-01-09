@@ -3,8 +3,8 @@
 # Licensed under the MIT License.
 # ---------------------------------------------------------------
 
-from typing import List, Optional
 
+from typing import List, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -42,13 +42,11 @@ class MaskClassificationSemantic(LightningModule):
         ckpt_path: Optional[str] = None,
         delta_weights: bool = False,
         load_ckpt_class_head: bool = True,
-        finetune_strategy: str = "last_n_blocks",
-        unfreeze_backbone_blocks: int = 4,
-        unfreeze_backbone_norm: bool = True,
-        # --- OOM safety ---
-        # Windowed validation is very memory hungry because it creates many crops.
-        # For Colab, it's often best to disable validation and evaluate later with evaluation.py.
-        skip_windowed_eval: bool = True,
+        # --- Step 0 (OE) options ---
+        oe_enabled: bool = False,
+        oe_lambda: float = 0.1,
+        oe_temperature: float = 1.0,
+        train_class_head_only: bool = False,
     ):
         super().__init__(
             network=network,
@@ -67,19 +65,22 @@ class MaskClassificationSemantic(LightningModule):
             ckpt_path=ckpt_path,
             delta_weights=delta_weights,
             load_ckpt_class_head=load_ckpt_class_head,
-            finetune_strategy=finetune_strategy,
-            unfreeze_backbone_blocks=unfreeze_backbone_blocks,
-            unfreeze_backbone_norm=unfreeze_backbone_norm,
+            train_class_head_only=train_class_head_only,
         )
 
         self.save_hyperparameters(ignore=["_class_path"])
-
-        self.skip_windowed_eval = bool(skip_windowed_eval)
 
         self.ignore_idx = ignore_idx
         self.mask_thresh = mask_thresh
         self.overlap_thresh = overlap_thresh
         self.stuff_classes = range(num_classes)
+
+        # --- Step 0 (OE) ---
+        self.oe_enabled = oe_enabled
+        self.oe_lambda = float(oe_lambda)
+        self.oe_temperature = float(oe_temperature)
+        if self.oe_temperature <= 0:
+            raise ValueError("oe_temperature must be > 0")
 
         self.criterion = MaskClassificationLoss(
             num_points=num_points,
@@ -92,10 +93,95 @@ class MaskClassificationSemantic(LightningModule):
             no_object_coefficient=no_object_coefficient,
         )
 
-        self.init_metrics_semantic(
-            ignore_idx,
-            self.network.num_blocks + 1 if self.network.masked_attn_enabled else 1,
-        )
+        self.init_metrics_semantic(ignore_idx, self.network.num_blocks + 1 if self.network.masked_attn_enabled else 1)
+
+    def training_step(self, batch, batch_idx):
+        """Training step with optional Outlier Exposure (OE).
+
+        Expected batch format (from datamodule):
+          imgs: Tensor [B,3,H,W]
+          targets: list[dict] with keys {"masks", "labels", ...}
+        If OE is enabled, each target may additionally contain:
+          target["oe_mask"]: Bool Tensor [H,W] marking pasted (OOD) pixels.
+        """
+        imgs, targets = batch
+
+        # Forward once
+        mask_logits_per_block, class_logits_per_block = self(imgs)
+
+        # Standard Mask2Former-style losses (all blocks)
+        losses_all_blocks = {}
+        for i, (mask_logits, class_logits) in enumerate(
+            list(zip(mask_logits_per_block, class_logits_per_block))
+        ):
+            losses = self.criterion(
+                masks_queries_logits=mask_logits,
+                class_queries_logits=class_logits,
+                targets=targets,
+            )
+            block_postfix = self.block_postfix(i)
+            losses = {f"{key}{block_postfix}": value for key, value in losses.items()}
+            losses_all_blocks |= losses
+
+        loss_total = self.criterion.loss_total(losses_all_blocks, self.log)
+
+        # Optional OE loss: encourage high-entropy / near-uniform predictions on pasted pixels
+        if self.oe_enabled:
+            # Collect oe masks if present
+            oe_masks = [t.get("oe_mask", None) for t in targets]
+            has_any_oe = any(m is not None for m in oe_masks)
+
+            if has_any_oe:
+                # Use the last block for OE regularization
+                mask_logits = mask_logits_per_block[-1]
+                class_logits = class_logits_per_block[-1]
+
+                # Upscale masks to image resolution
+                mask_logits = F.interpolate(mask_logits, self.img_size, mode="bilinear")
+
+                # Build per-pixel class scores then normalize across classes
+                pixel_scores = self.to_per_pixel_logits_semantic(mask_logits, class_logits)  # [B,C,H,W]
+                probs = torch.softmax(pixel_scores / self.oe_temperature, dim=1)
+                log_probs = torch.log(probs.clamp_min(1e-8))
+
+                oe_loss_sum = None
+                oe_count = 0
+
+                for b, m in enumerate(oe_masks):
+                    if m is None:
+                        continue
+                    # Ensure bool [H,W]
+                    if m.ndim == 3 and m.shape[0] == 1:
+                        m = m[0]
+                    m = m.to(device=log_probs.device).bool()
+
+                    # If mask resolution mismatches, resize with nearest
+                    if tuple(m.shape[-2:]) != tuple(self.img_size):
+                        m = (
+                            F.interpolate(
+                                m[None, None].float(),
+                                size=self.img_size,
+                                mode="nearest",
+                            )[0, 0]
+                            > 0.5
+                        )
+
+                    if m.sum() == 0:
+                        continue
+
+                    # Cross-entropy to uniform distribution over known classes:
+                    # L = -mean_c log p_c  (averaged over classes and selected pixels)
+                    oe_loss_b = -log_probs[b][:, m].mean()
+
+                    oe_loss_sum = oe_loss_b if oe_loss_sum is None else (oe_loss_sum + oe_loss_b)
+                    oe_count += 1
+
+                if oe_count > 0:
+                    oe_loss = oe_loss_sum / oe_count  # type: ignore
+                    self.log("losses/train_oe_uniform", oe_loss, sync_dist=True)
+                    loss_total = loss_total + (self.oe_lambda * oe_loss)
+
+        return loss_total
 
     def eval_step(
         self,
@@ -103,11 +189,6 @@ class MaskClassificationSemantic(LightningModule):
         batch_idx=None,
         log_prefix=None,
     ):
-        # Windowed evaluation is extremely memory hungry (many crops per image).
-        # On Colab it can OOM during Lightning's sanity check.
-        if self.skip_windowed_eval or getattr(getattr(self, "trainer", None), "sanity_checking", False):
-            return
-
         imgs, targets = batch
 
         img_sizes = [img.shape[-2:] for img in imgs]
@@ -131,11 +212,7 @@ class MaskClassificationSemantic(LightningModule):
                 )
 
     def on_validation_epoch_end(self):
-        if self.skip_windowed_eval or getattr(getattr(self, "trainer", None), "sanity_checking", False):
-            return
         self._on_eval_epoch_end_semantic("val")
 
     def on_validation_end(self):
-        if self.skip_windowed_eval or getattr(getattr(self, "trainer", None), "sanity_checking", False):
-            return
         self._on_eval_end_semantic("val")
