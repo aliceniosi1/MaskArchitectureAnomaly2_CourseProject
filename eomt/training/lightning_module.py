@@ -59,7 +59,6 @@ class LightningModule(lightning.LightningModule):
         ckpt_path=None,
         delta_weights=False,
         load_ckpt_class_head=True,
-        train_class_head_only: bool = False,
     ):
         super().__init__()
 
@@ -76,9 +75,6 @@ class LightningModule(lightning.LightningModule):
         self.poly_power = poly_power
         self.warmup_steps = warmup_steps
         self.llrd_l2_enabled = llrd_l2_enabled
-
-        # Step-0 finetuning: freeze everything except the classification head
-        self.train_class_head_only = train_class_head_only
 
         self.strict_loading = False
 
@@ -101,60 +97,9 @@ class LightningModule(lightning.LightningModule):
             incompatible_keys = self.load_state_dict(ckpt, strict=False)
             self._raise_on_incompatible(incompatible_keys, load_ckpt_class_head)
 
-        # Apply freezing AFTER checkpoint loading so weights are loaded first
-        if self.train_class_head_only:
-            self._freeze_all_but_class_head()
-
         self.log = torch.compiler.disable(self.log)  # type: ignore
 
-    def _freeze_all_but_class_head(self):
-        """Freeze all parameters except the (Cityscapes) class head.
-
-        This is the intended setup for Step 0 (OE) where we adapt only a tiny
-        number of parameters to avoid catastrophic forgetting.
-        """
-        trainable_keys = ("network.class_head", "network.class_predictor")
-
-        total, trainable = 0, 0
-        for name, p in self.named_parameters():
-            total += p.numel()
-            if any(k in name for k in trainable_keys):
-                p.requires_grad = True
-                trainable += p.numel()
-            else:
-                p.requires_grad = False
-
-        logging.info(
-            f"[Step0] train_class_head_only=True -> Trainable params: {trainable:,} / {total:,}"
-        )
-
     def configure_optimizers(self):
-        # Step 0: only optimize parameters that require gradients (typically just the class head)
-        if getattr(self, "train_class_head_only", False):
-            trainable_params = [p for p in self.parameters() if p.requires_grad]
-            if len(trainable_params) == 0:
-                raise RuntimeError(
-                    "train_class_head_only=True but no parameters have requires_grad=True"
-                )
-
-            optimizer = AdamW(trainable_params, lr=self.lr, weight_decay=self.weight_decay)
-            scheduler = TwoStageWarmupPolySchedule(
-                optimizer,
-                num_backbone_params=0,
-                warmup_steps=self.warmup_steps,
-                total_steps=self.trainer.estimated_stepping_batches,
-                poly_power=self.poly_power,
-            )
-
-            return {
-                "optimizer": optimizer,
-                "lr_scheduler": {
-                    "scheduler": scheduler,
-                    "interval": "step",
-                    "frequency": 1,
-                },
-            }
-
         encoder_param_names = {
             n for n, _ in self.network.encoder.backbone.named_parameters()
         }
@@ -168,8 +113,6 @@ class LightningModule(lightning.LightningModule):
         ).tolist()
 
         for name, param in reversed(list(self.named_parameters())):
-            if not param.requires_grad:
-                continue
             lr = self.lr
 
             if name.replace("network.encoder.backbone.", "") in encoder_param_names:
