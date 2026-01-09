@@ -45,6 +45,8 @@ class MaskClassificationSemantic(LightningModule):
         logit_norm_enabled: bool = False,
         logit_norm_tau: float = 0.04,
         logit_norm_eps: float = 1e-6,
+        #fine-tuning
+        train_class_head_only: bool = False,
     ):
         super().__init__(
             network=network,
@@ -63,6 +65,7 @@ class MaskClassificationSemantic(LightningModule):
             ckpt_path=ckpt_path,
             delta_weights=delta_weights,
             load_ckpt_class_head=load_ckpt_class_head,
+            train_class_head_only=train_class_head_only,
         )
 
         self.save_hyperparameters(ignore=["_class_path"])
@@ -71,7 +74,6 @@ class MaskClassificationSemantic(LightningModule):
         self.mask_thresh = mask_thresh
         self.overlap_thresh = overlap_thresh
         self.stuff_classes = range(num_classes)
-
         self.criterion = MaskClassificationLoss(
             num_points=num_points,
             oversample_ratio=oversample_ratio,

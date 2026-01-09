@@ -59,6 +59,7 @@ class LightningModule(lightning.LightningModule):
         ckpt_path=None,
         delta_weights=False,
         load_ckpt_class_head=True,
+        train_class_head_only=False,
     ):
         super().__init__()
 
@@ -77,6 +78,14 @@ class LightningModule(lightning.LightningModule):
         self.llrd_l2_enabled = llrd_l2_enabled
 
         self.strict_loading = False
+        self.train_class_head_only = train_class_head_only
+        if self.train_class_head_only:
+        # freeze tutto
+            for p in self.network.parameters():
+                p.requires_grad = False
+            # unfreeze solo class_head
+            for p in self.network.class_head.parameters():
+                p.requires_grad = True
 
         if delta_weights and ckpt_path:
             logging.info("Delta weights mode")
@@ -112,10 +121,12 @@ class LightningModule(lightning.LightningModule):
             backbone_blocks - self.network.num_blocks, backbone_blocks
         ).tolist()
 
-        for name, param in reversed(list(self.named_parameters())):
+        for name, param in reversed(list(self.network.named_parameters())):
+            if not param.requires_grad:
+                continue
             lr = self.lr
 
-            if name.replace("network.encoder.backbone.", "") in encoder_param_names:
+            if name.replace("encoder.backbone.", "") in encoder_param_names:
                 name_list = name.split(".")
 
                 is_block = False
