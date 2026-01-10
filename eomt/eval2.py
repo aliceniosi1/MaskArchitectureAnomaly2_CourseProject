@@ -171,19 +171,20 @@ def load_model_any(weights_path: str, config_path: str | None, img_size: tuple[i
     cli_args = [
         "-c", config_path,
 
-        # carico i pesi .bin attraverso la tua logica interna (ckpt_path)
         "--model.init_args.ckpt_path", weights_path,
 
-        # fix: nel tuo YAML spesso questi sono None se non passi dal main.py con link_arguments
         "--model.init_args.img_size", f"[{H},{W}]",
         "--model.init_args.network.init_args.encoder.init_args.img_size", f"[{H},{W}]",
         "--model.init_args.num_classes", str(num_classes),
         "--model.init_args.network.init_args.num_classes", str(num_classes),
 
-        # evito WandB / checkpointing
-        "--trainer.logger=false",
-        "--trainer.enable_checkpointing=false",
-        "--trainer.enable_progress_bar=false",
+        # IMPORTANTISSIMO: svuoto callbacks (togli ModelCheckpoint dal YAML)
+        "--trainer.callbacks", "[]",
+
+        # disabilito logger e checkpointing
+        "--trainer.logger", "false",
+        "--trainer.enable_checkpointing", "false",
+        "--trainer.enable_progress_bar", "false",
     ]
 
     # IMPORTANT: evito che LightningCLI mescoli gli argv dello script eval
