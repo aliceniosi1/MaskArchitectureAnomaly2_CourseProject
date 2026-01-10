@@ -187,7 +187,6 @@ def main():
     # Build project LightningModule from YAML (NO fit)
     # IMPORTANT: disable logger here to avoid W&B init during eval
     cli_args = [
-        "fit",
         "--config", args.config,
         "--model.init_args.ckpt_path", args.ckpt_path,
         "--trainer.logger=false",
