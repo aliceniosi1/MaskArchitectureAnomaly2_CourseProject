@@ -168,7 +168,7 @@ def load_ood_gt_from_img_path(img_path: str) -> np.ndarray:
 
     return ood_gts
 
-def load_ood_gt_from_img_path11(img_path: str) -> np.ndarray:
+def load_ood_gt_from_img_path(img_path: str) -> np.ndarray:
     """
     Ritorna HxW con valori:
       0   = IND
