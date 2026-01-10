@@ -15,7 +15,7 @@ from lightning.pytorch.cli import LightningCLI
 
 from training.lightning_module import LightningModule
 from datasets.lightning_data_module import LightningDataModule
-
+import sys
 
 # -------------------------
 # GT mapping (ONLY change requested)
@@ -184,31 +184,47 @@ def main():
     print("Temps:", temps)
     print("Methods:", methods)
 
+    # Decido img_size da usare per istanziare il modello (serve perché nel YAML è None)
+    if args.img_size is not None:
+        IMG_SIZE = tuple(args.img_size)   # (H,W)
+    else:
+        IMG_SIZE = (640, 640)             # default sicuro (o 1024,1024 se preferisci)
+    H, W = IMG_SIZE
     # Build project LightningModule from YAML (NO fit)
     # IMPORTANT: disable logger here to avoid W&B init during eval
     cli_args = [
-        "--config", args.config,
-        "--model.init_args.ckpt_path", args.ckpt_path,
-        "--trainer.logger=false",
-        "--trainer.enable_checkpointing=false",
-    ]
+    "-c", args.config,
+    "--model.init_args.ckpt_path", args.ckpt_path,
 
-    cli = EvalOnlyCLI(
-    LightningModule,
-    LightningDataModule,
-    subclass_mode_model=True,
-    subclass_mode_data=True,
-    args=cli_args,   # <-- QUI la differenza: non parser_kwargs
-)
+    # FIX: nel YAML risultano None senza i link del tuo main.py
+    "--model.init_args.img_size", f"[{H},{W}]",
+    "--model.init_args.network.init_args.encoder.init_args.img_size", f"[{H},{W}]",
+
+    "--model.init_args.num_classes", "19",
+    "--model.init_args.network.init_args.num_classes", "19",
+
+    # evita WandB e checkpointing durante eval
+    "--trainer.logger=false",
+    "--trainer.enable_checkpointing=false",
+]
+
+    argv_bak = sys.argv
+    sys.argv = [sys.argv[0]]  # IMPORTANT: evita che LightningCLI legga anche gli args di eval2.py
+    try:
+        cli = EvalOnlyCLI(
+            LightningModule,
+            LightningDataModule,
+            subclass_mode_model=True,
+            subclass_mode_data=True,
+            args=cli_args,
+        )
+    finally:
+        sys.argv = argv_bak
 
     lm: LightningModule = cli.model
     lm.to(device)
     lm.eval()
-
-    if args.img_size is not None:
-        lm.img_size = tuple(args.img_size)
-
-    IMG_SIZE = tuple(lm.img_size)  # (H,W)
+    IMG_SIZE = tuple(lm.img_size)
     print("IMG_SIZE used:", IMG_SIZE)
 
     file_list = sorted(glob.glob(os.path.expanduser(args.input)))
