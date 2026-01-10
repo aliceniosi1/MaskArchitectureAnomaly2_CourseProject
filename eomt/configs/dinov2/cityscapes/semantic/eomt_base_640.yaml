@@ -1,4 +1,11 @@
 trainer:
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.model_checkpoint.ModelCheckpoint
+      init_args:
+        dirpath: /content/drive/MyDrive/eomt_runs/head_only_640/checkpoints
+        save_last: true
+        save_top_k: 0
+        save_weights_only: true
   max_epochs: 107
   default_root_dir: /content/drive/MyDrive/eomt_runs/head_only_640
   logger:
@@ -7,6 +14,7 @@ trainer:
       resume: allow
       project: "eomt"
       name: "cityscapes_semantic_eomt_base_640"
+  
 model:
   class_path: training.mask_classification_semantic.MaskClassificationSemantic
   init_args:
