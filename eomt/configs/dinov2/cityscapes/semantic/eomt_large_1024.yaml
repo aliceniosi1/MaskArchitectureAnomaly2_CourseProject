@@ -7,7 +7,6 @@ trainer:
       resume: allow
       project: "eomt"
       name: "cityscapes_semantic_eomt_large_1024"
-      save_dir: /content/drive/MyDrive/eomt_runs/head_only_640/wandb
 model:
   class_path: training.mask_classification_semantic.MaskClassificationSemantic
   init_args:
