@@ -128,6 +128,48 @@ def load_eomt_model(ckpt_path: str, device: torch.device) -> EoMT:
 # -----------------------------------------------------------------------------
 def load_ood_gt_from_img_path(img_path: str) -> np.ndarray:
     """
+    Restituisce una mappa HxW con valori:
+      1 = OOD
+      0 = IND
+      255 = IGNORE (se presente)
+    """
+    pathGT = img_path.replace("images", "labels_masks")
+
+    # estensioni tipiche
+    lower = pathGT.lower()
+    if "roadobsticle21" in lower or "roadobstacle21" in lower or "roadanomaly21" in lower:
+        pathGT = os.path.splitext(pathGT)[0] + ".png"
+    if "fs_static" in lower:
+        pathGT = os.path.splitext(pathGT)[0] + ".png"
+    if "roadanomaly" in lower:
+        pathGT = os.path.splitext(pathGT)[0] + ".png"
+
+    mask = Image.open(pathGT)
+    mask = target_transform(mask)
+    ood_gts = np.array(mask)
+
+    # --- Regole storiche (come nei tuoi script) ---
+    # RoadAnomaly (vecchio): spesso {0,2} dove 2=OOD
+    uniq = np.unique(ood_gts)
+    if 2 in uniq and 1 not in uniq:
+        ood_gts = np.where(ood_gts == 2, 1, 0).astype(np.uint8)
+
+    # LostAndFound (se usi quella versione legacy)
+    if "lostandfound" in pathGT.lower():
+        ood_gts = np.where((ood_gts == 0), 255, ood_gts)
+        ood_gts = np.where((ood_gts == 1), 0, ood_gts)
+        ood_gts = np.where((ood_gts > 1) & (ood_gts < 201), 1, ood_gts).astype(np.uint8)
+
+    # Streethazard legacy
+    if "streethazard" in pathGT.lower():
+        ood_gts = np.where((ood_gts == 14), 255, ood_gts)
+        ood_gts = np.where((ood_gts < 20), 0, ood_gts)
+        ood_gts = np.where((ood_gts == 255), 1, ood_gts).astype(np.uint8)
+
+    return ood_gts
+
+def load_ood_gt_from_img_path11(img_path: str) -> np.ndarray:
+    """
     Ritorna HxW con valori:
       0   = IND
       1   = OOD
