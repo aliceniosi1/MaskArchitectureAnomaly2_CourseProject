@@ -108,12 +108,12 @@ class LightningModule(lightning.LightningModule):
         self.log = torch.compiler.disable(self.log)  # type: ignore
 
     def _freeze_all_but_class_head(self):
-        """Freeze all parameters except the (Cityscapes) class head.
+        """Freeze all parameters except the (Cityscapes) class head and mask head.
 
         This is the intended setup for Step 0 (OE) where we adapt only a tiny
         number of parameters to avoid catastrophic forgetting.
         """
-        trainable_keys = ("network.class_head", "network.class_predictor")
+        trainable_keys = ("network.class_head", "network.class_predictor", "network.mask_head")
 
         total, trainable = 0, 0
         for name, p in self.named_parameters():
@@ -125,7 +125,7 @@ class LightningModule(lightning.LightningModule):
                 p.requires_grad = False
 
         logging.info(
-            f"[Step0] train_class_head_only=True -> Trainable params: {trainable:,} / {total:,}"
+            f"[Step0] train_class_head_only=True -> Trainable params: {trainable:,} / {total:,} (includes class_head + mask_head)"
         )
 
     def configure_optimizers(self):
