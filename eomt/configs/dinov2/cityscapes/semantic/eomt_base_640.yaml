@@ -14,7 +14,7 @@ model:
     attn_mask_annealing_end_steps: [6634, 11609, 16585]
     # --- Step 0 (OE) ---
     train_class_head_only: true
-    oe_enabled: true
+    oe_enabled: false  # Set to true if you want to use Outlier Exposure with COCO dataset
     oe_lambda: 0.1
     oe_temperature: 1.0
     lr: 0.001
@@ -35,7 +35,7 @@ data:
     # path: "/content/drive/MyDrive/<CITYSCAPES_ZIPS_DIR>"
 
     # --- Step 0 (OE) ---
-    oe_enabled: true
+    oe_enabled: false  # Set to true if you want to use Outlier Exposure with COCO dataset
     # Folder containing: train2017.zip and annotations_trainval2017.zip
     oe_coco_path: "/content/drive/MyDrive/<COCO_ZIPS_DIR>"
     oe_paste_prob: 0.5
