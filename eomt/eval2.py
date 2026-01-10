@@ -126,7 +126,7 @@ def load_eomt_model(ckpt_path: str, device: torch.device) -> EoMT:
 # -----------------------------------------------------------------------------
 # GT loading + normalization (robusta) -> output sempre {0,1,255}
 # -----------------------------------------------------------------------------
-def load_ood_gt_from_img_path(img_path: str) -> np.ndarray:
+def load_ood_gt_from_img_path11(img_path: str) -> np.ndarray:
     """
     Restituisce una mappa HxW con valori:
       1 = OOD
