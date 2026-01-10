@@ -2,6 +2,7 @@
 import os
 import glob
 import random
+import sys
 from argparse import ArgumentParser
 from collections import defaultdict
 
@@ -42,7 +43,6 @@ def map_gt_to_ood_binary(ood_gts: np.ndarray, dataset: str) -> np.ndarray:
         out = np.full_like(ood_gts, 255, dtype=np.uint8)  # default ignore
         out[ood_gts == 0] = 0
         out[ood_gts == 2] = 1
-        # if any weird values appear -> stay 255
         return out
 
     # Others: already {0,1,255}
@@ -98,7 +98,9 @@ def fpr_at_95_tpr(scores: np.ndarray, labels: np.ndarray) -> float:
     idxs = np.where(tpr >= 0.95)[0]
     if len(idxs) == 0:
         return 1.0
+    # più corretto: tra tutti i punti con TPR>=0.95 prendo il minimo FPR
     return float(np.min(fpr[idxs]))
+
 
 def parse_list_floats(s: str):
     s = s.replace(",", " ").strip()
@@ -114,10 +116,16 @@ def anomaly_map_from_outputs(
     scores_chw: torch.Tensor,
     probs_chw: torch.Tensor,
     method: str,
-    eps: float = 1e-8) -> torch.Tensor:
+    eps: float = 1e-8
+) -> torch.Tensor:
     """
     scores_chw: [C,H,W] per-pixel class scores (output di to_per_pixel_logits_semantic)
     probs_chw : [C,H,W] probs per pixel (scores normalizzati su C)
+
+    scoring:
+      - MSP:        1 - max(prob)
+      - MaxEntropy: entropy(prob)
+      - MaxLogit:   -max(score)   (qui "score" è il più vicino ai tuoi logits per-pixel disponibili)
     """
     method = method.lower()
 
@@ -130,21 +138,88 @@ def anomaly_map_from_outputs(
         return entropy
 
     if method == "maxlogit":
-        # proxy "max logit" nel tuo setup = -max score (più corretto di -max prob)
         maxs = scores_chw.max(dim=0).values
         return -maxs
 
     raise ValueError(f"Unsupported method: {method}")
 
 
+# -------------------------
+# Load model from .ckpt OR .bin
+# -------------------------
+def load_model_any(weights_path: str, config_path: str | None, img_size: tuple[int, int], num_classes: int) -> LightningModule:
+    """
+    - .ckpt: LightningModule.load_from_checkpoint
+    - else (e.g., .bin): instantiate from YAML via LightningCLI(run=False) and pass ckpt_path=<.bin>
+    """
+    lp = weights_path.lower()
+    if lp.endswith(".ckpt"):
+        lm: LightningModule = LightningModule.load_from_checkpoint(weights_path, map_location="cpu")
+        return lm
+
+    # For .bin I need a config to build the architecture/hparams exactly like training
+    if config_path is None:
+        raise ValueError("Per usare un .bin devo passare anche --config (il tuo YAML di training).")
+
+    # Import solo qui (così non serve se uso .ckpt)
+    from lightning.pytorch.cli import LightningCLI
+    from datasets.lightning_data_module import LightningDataModule
+
+    H, W = img_size
+
+    # args per LightningCLI: costruisco model+data dal YAML, ma NON avvio fit/test.
+    cli_args = [
+        "-c", config_path,
+
+        # carico i pesi .bin attraverso la tua logica interna (ckpt_path)
+        "--model.init_args.ckpt_path", weights_path,
+
+        # fix: nel tuo YAML spesso questi sono None se non passi dal main.py con link_arguments
+        "--model.init_args.img_size", f"[{H},{W}]",
+        "--model.init_args.network.init_args.encoder.init_args.img_size", f"[{H},{W}]",
+        "--model.init_args.num_classes", str(num_classes),
+        "--model.init_args.network.init_args.num_classes", str(num_classes),
+
+        # evito WandB / checkpointing
+        "--trainer.logger=false",
+        "--trainer.enable_checkpointing=false",
+        "--trainer.enable_progress_bar=false",
+    ]
+
+    # IMPORTANT: evito che LightningCLI mescoli gli argv dello script eval
+    argv_bak = sys.argv
+    sys.argv = [sys.argv[0]]
+    try:
+        cli = LightningCLI(
+            LightningModule,
+            LightningDataModule,
+            subclass_mode_model=True,
+            subclass_mode_data=True,
+            run=False,
+            save_config_callback=None,
+            args=cli_args,
+        )
+        lm: LightningModule = cli.model
+        return lm
+    finally:
+        sys.argv = argv_bak
+
+
 @torch.no_grad()
 def main():
     parser = ArgumentParser()
-    parser.add_argument("--ckpt", type=str, required=True, help="Lightning checkpoint .ckpt (from ModelCheckpoint)")
+
+    # ora accetto .ckpt O .bin
+    parser.add_argument("--weights", type=str, required=True, help="Path to weights: .ckpt (Lightning) OR .bin (project weights)")
+
+    # per .bin serve anche il config YAML (per .ckpt lo ignoro)
+    parser.add_argument("--config", type=str, default=None, help="YAML config used in training (required if --weights is .bin)")
+
     parser.add_argument("--input", type=str, required=True, help='Glob images, e.g. "/path/RoadAnomaly/images/*.jpg"')
     parser.add_argument("--temps", type=str, default="1.0", help='Temperatures, e.g. "0.5,1,2,4"')
     parser.add_argument("--methods", type=str, default="msp", help='Methods, e.g. "msp,maxentropy,maxlogit"')
     parser.add_argument("--img_size", type=int, nargs=2, default=(640, 640), help="H W resize for eval")
+    parser.add_argument("--num_classes", type=int, default=19, help="Number of semantic classes (Cityscapes=19)")
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -165,13 +240,12 @@ def main():
     print("Temps:", temps)
     print("Methods:", methods)
 
-    # --- Load LightningModule from checkpoint
-    # This restores hyperparameters saved by Lightning, and loads weights.
-    lm: LightningModule = LightningModule.load_from_checkpoint(args.ckpt, map_location="cpu")
+    # --- Load model (ckpt or bin)
+    lm = load_model_any(args.weights, args.config, IMG_SIZE, args.num_classes)
     lm.to(device)
     lm.eval()
 
-    # Ensure module uses the eval resize if you want
+    # Ensure module uses the eval resize
     lm.img_size = IMG_SIZE
 
     file_list = sorted(glob.glob(os.path.expanduser(args.input)))
@@ -203,16 +277,19 @@ def main():
         ds = infer_dataset_from_path(pathGT)
         ood_bin = map_gt_to_ood_binary(ood_raw, ds)
 
+        # devo avere almeno 1 pixel valido (non ignore)
         if not np.any(ood_bin != 255):
             continue
 
         for T in temps:
+            # temperature scaling SOLO sui class logits
             clsT = class_logits / float(T)
 
             # per-pixel class scores [B,C,H,W]
             per_pixel_scores = LightningModule.to_per_pixel_logits_semantic(mask_logits, clsT)
             scores_chw = per_pixel_scores[0]  # [C,H,W]
-            # normalize to probs per pixel across classes
+
+            # probs per pixel across classes
             probs = per_pixel_scores / per_pixel_scores.sum(dim=1, keepdim=True).clamp_min(1e-8)
             probs_chw = probs[0]  # [C,H,W]
 
