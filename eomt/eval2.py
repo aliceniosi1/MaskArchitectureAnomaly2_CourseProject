@@ -187,6 +187,7 @@ def main():
     # Build project LightningModule from YAML (NO fit)
     # IMPORTANT: disable logger here to avoid W&B init during eval
     cli_args = [
+        "fit",
         "--config", args.config,
         "--model.init_args.ckpt_path", args.ckpt_path,
         "--trainer.logger=false",
@@ -194,12 +195,12 @@ def main():
     ]
 
     cli = EvalOnlyCLI(
-        LightningModule,
-        LightningDataModule,
-        subclass_mode_model=True,
-        subclass_mode_data=True,
-        parser_kwargs={"args": cli_args},
-    )
+    LightningModule,
+    LightningDataModule,
+    subclass_mode_model=True,
+    subclass_mode_data=True,
+    args=cli_args,   # <-- QUI la differenza: non parser_kwargs
+)
 
     lm: LightningModule = cli.model
     lm.to(device)
