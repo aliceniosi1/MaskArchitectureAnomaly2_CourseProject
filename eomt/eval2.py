@@ -241,8 +241,10 @@ def main():
 
             ood_gts = load_ood_gt_from_img_path(path, out_size=IMG_SIZE)  # HxW
 
+            # Se l'immagine non contiene alcun pixel OOD (=1), la escludo completamente dall'eval
             if not (ood_gts == 1).any():
                 skipped_no_ood += 1
+                continue
 
             with torch.no_grad():
                 mask_logits_per_layer, class_logits_per_layer = model(images)
