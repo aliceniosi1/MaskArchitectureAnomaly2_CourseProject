@@ -13,8 +13,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from sklearn.metrics import average_precision_score, roc_curve
+#from sklearn.metrics import average_precision_score, roc_curve
 from torchvision.transforms import Compose, Resize, ToTensor
+from ood_metrics import fpr_at_95_tpr, auprc_score
 
 # -----------------------------------------------------------------------------
 # IMPORT EoMT (aggiungo la cartella eomt al PYTHONPATH)
@@ -66,17 +67,16 @@ IGNORE_LABEL = 255
 # -----------------------------------------------------------------------------
 # METRICA FPR@95TPR (prendo il minimo FPR tra i punti con TPR>=0.95)
 # -----------------------------------------------------------------------------
+
+"""
 def fpr_at_95_tpr(scores: np.ndarray, labels: np.ndarray) -> float:
-    """
-    scores: anomaly score (più alto => più OOD)
-    labels: 1=OOD, 0=IND
-    """
+   
     fpr, tpr, _ = roc_curve(labels, scores, pos_label=1)
     idxs = np.where(tpr >= 0.95)[0]
     if len(idxs) == 0:
         return 1.0
     return float(np.min(fpr[idxs]))
-
+"""
 
 # -----------------------------------------------------------------------------
 # MODEL LOADER
@@ -443,7 +443,7 @@ def main():
             axis=0
         )
 
-        prc_auc = average_precision_score(val_label, val_out) * 100.0
+        prc_auc = auprc_score(val_label, val_out) * 100.0
         fpr95 = fpr_at_95_tpr(val_out, val_label) * 100.0
 
         # update best per method
