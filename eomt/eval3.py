@@ -58,14 +58,14 @@ input_transform = Compose(
 # -----------------------------------------------------------------------------
 # Loader modello (ritorna LightningModule, perché infer_semantic usa windowing)
 # -----------------------------------------------------------------------------
-def load_eomt_lightning(ckpt_path: str, device: torch.device) -> LightningModule:
+def load_eomt_lightning(ckpt_path: str, device: torch.device, masked_attn_enabled: bool = False) -> LightningModule:
     encoder = ViT(img_size=IMG_SIZE, backbone_name=BACKBONE_NAME)
     network = EoMT(
         encoder=encoder,
         num_classes=NUM_CLASSES,
         num_q=NUM_QUERIES,
         num_blocks=NUM_BLOCKS,
-        masked_attn_enabled=False,
+        masked_attn_enabled=masked_attn_enabled,
     )
 
     lm = LightningModule(
