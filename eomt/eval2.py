@@ -189,7 +189,7 @@ def load_ood_gt_from_img_path(img_path: str, out_size=None) -> np.ndarray:
     pathGT = img_path.replace("images", "labels_masks")
     pathGT = os.path.splitext(pathGT)[0] + ".png"
 
-    gt_pil = Image.open(pathGT)
+    gt_pil = Image.open(pathGT).convert("L")
     if out_size is not None:
         gt_pil = gt_pil.resize((out_size[1], out_size[0]), resample=Image.NEAREST)
 
@@ -203,10 +203,6 @@ def load_ood_gt_from_img_path(img_path: str, out_size=None) -> np.ndarray:
 
     if uniq.issubset({0, 1, 255}):
         return gt.astype(np.uint8, copy=False)
-
-    if uniq.issubset({0, 255}):
-        return gt.astype(np.uint8, copy=False)
-
     raise ValueError(f"Unexpected GT values {sorted(uniq)} in {pathGT}")
    
 
@@ -341,7 +337,7 @@ def main():
             images = input_transform(img_pil).unsqueeze(0).float().to(device)  # [1,3,H,W]
 
             # --- gt ---
-            ood_gts = load_ood_gt_from_img_path(path)  # HxW in {0,1,255}
+            ood_gts = load_ood_gt_from_img_path(path, out_size=IMG_SIZE)  # HxW in {0,1,255}
 
             # Masks
             ood_mask = (ood_gts == 1)
@@ -434,29 +430,19 @@ def main():
 
         prc_auc = average_precision_score(val_label, val_out) * 100.0
 
-        fpr95_min_val   = fpr_at_95_tpr(val_out, val_label) * 100.0
-        fpr95_first_val = fpr95_first(val_out, val_label) * 100.0
+    
         fpr95_int_val   = fpr95_interp(val_out, val_label) * 100.0
-        fpr_q, tpr_q, thr_q = fpr95_quantile(ind_out, ood_out)
-        # sanity: medie/mediane
+        
         mean_ood, mean_ind = float(ood_out.mean()), float(ind_out.mean())
         med_ood,  med_ind  = float(np.median(ood_out)), float(np.median(ind_out))
-        direction_ok = (mean_ood > mean_ind) and (med_ood > med_ind)
+        
 
-        p95_ind = float(np.percentile(ind_out, 95))
-        p05_ood = float(np.percentile(ood_out, 5))
         #print("direction_ok:", direction_ok)
         print(
             f"{method:<10s} {T:<8.3f} | "
             f"AuPRC {prc_auc:6.2f} | "
-            f"FPR95(min) {fpr95_min_val:6.2f} | "
-            f"FPR95(first) {fpr95_first_val:6.2f} | "
             f"FPR95(int) {fpr95_int_val:6.2f} | "
-            f"FPR95(q) {fpr_q*100:6.2f} (TPR={tpr_q:.3f}, thr={thr_q:.4f}) | "
-            f"mean(ood/ind) {mean_ood:.4f}/{mean_ind:.4f} | "
-            f"med(ood/ind) {med_ood:.4f}/{med_ind:.4f} | "
-            f"dir_ok {direction_ok} | "
-            f"p95(ind) {p95_ind:.4f} | p05(ood) {p05_ood:.4f}"
+            
         )
 
         # update best per method
