@@ -12,6 +12,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.amp import autocast
 from PIL import Image
 from torchvision.transforms import Compose, Resize, ToTensor
 from compute_metrics import get_metrics
@@ -55,6 +56,17 @@ input_transform = Compose(
 )
 
 IGNORE_LABEL = 255
+
+
+class _EvalDataCfg:
+    img_size = IMG_SIZE
+
+# will be overwritten in main if needed
+data = _EvalDataCfg()
+
+# will be set in main (infer_semantic relies on these globals)
+model = None
+device = None
 
 # -----------------------------------------------------------------------------
 # MODEL LOADER
@@ -167,6 +179,26 @@ def anomaly_map_from_pixel_scores(
 
     raise ValueError(f"Unknown method: {method}")
 
+
+def infer_semantic(img, target, temperature: float = 1.0):
+    with torch.no_grad(), autocast(dtype=torch.float16, device_type="cuda"):
+        imgs = [img.to(device)]
+        img_sizes = [img.shape[-2:] for img in imgs]
+        crops, origins = model.window_imgs_semantic(imgs)
+
+        mask_logits_per_layer, class_logits_per_layer = model(crops)
+        mask_logits = F.interpolate(
+            mask_logits_per_layer[-1], data.img_size, mode="bilinear"
+        )
+
+        crop_logits = model.to_per_pixel_logits_semantic(
+            mask_logits, class_logits_per_layer[-1] / float(temperature)
+        )
+        logits = model.revert_window_logits_semantic(crop_logits, origins, img_sizes)
+
+   
+    return logits
+
 # -----------------------------------------------------------------------------
 # MAIN
 # -----------------------------------------------------------------------------
@@ -199,6 +231,14 @@ def main():
     ckpt_path = os.path.join(args.loadDir, args.loadWeights)
     print("Loading EoMT checkpoint:", ckpt_path)
     model = load_eomt_model(ckpt_path, device)
+    # set globals used by infer_semantic()
+    globals()["model"] = model
+    globals()["device"] = device
+    globals()["data"].img_size = IMG_SIZE
+
+    if device.type != "cuda":
+        raise RuntimeError("infer_semantic() uses autocast(device_type='cuda'): run without --cpu and with CUDA available.")
+
     print("Model LOADED successfully (EoMT + DINOv2)")
 
     # Parse methods (accetto sia spazi che virgole)
@@ -246,36 +286,37 @@ def main():
                 skipped_no_ood += 1
                 continue
 
-            with torch.no_grad():
-                mask_logits_per_layer, class_logits_per_layer = model(images)
-                mask_logits = mask_logits_per_layer[-1]    # [B,Q,h,w]
-                class_logits = class_logits_per_layer[-1]  # [B,Q,C+1]
+            # infer_semantic expects a single image tensor [3,H,W]
+            img_tensor = images[0]
 
-                # upsample masks -> IMG_SIZE
-                mask_logits = F.interpolate(
-                    mask_logits, size=IMG_SIZE, mode="bilinear", align_corners=False
-                )
+            for T in temps:
+                logits = infer_semantic(img_tensor, target=None, temperature=T)
 
-                for T in temps:
-                    pixel_scores_bchw = per_pixel_scores_with_temperature(
-                        mask_logits=mask_logits,
-                        class_logits=class_logits,
-                        temperature=T,
-                    )
-                    pixel_scores = pixel_scores_bchw[0]  # [C,H,W]
+                # logits can be Tensor [B,C,H,W] or list/tuple of tensors
+                if isinstance(logits, (list, tuple)):
+                    logits_t = logits[0]
+                else:
+                    logits_t = logits
 
-                    for method in methods:
-                        amap = anomaly_map_from_pixel_scores(pixel_scores, method=method)  # [H,W]
-                        amap_np = amap.detach().cpu().numpy().astype(np.float32, copy=False)
+                if logits_t.dim() == 4:
+                    logits_chw = logits_t[0]
+                elif logits_t.dim() == 3:
+                    logits_chw = logits_t
+                else:
+                    raise RuntimeError(f"Unexpected logits shape: {tuple(logits_t.shape)}")
 
-                        valid_mask = (ood_gts <= 1)  # 0/1, escludo 255
-                        flat_labels = ood_gts[valid_mask].astype(np.uint8, copy=False).reshape(-1)
-                        flat_pred = amap_np[valid_mask].astype(np.float32, copy=False).reshape(-1)
+                for method in methods:
+                    amap = anomaly_map_from_pixel_scores(logits_chw, method=method)  # [H,W]
+                    amap_np = amap.detach().cpu().numpy().astype(np.float32, copy=False)
 
-                        key = (float(T), method)
-                        if flat_labels.size > 0:
-                            acc[key]["labels"].append(flat_labels)
-                            acc[key]["pred"].append(flat_pred)
+                    valid_mask = (ood_gts <= 1)  # 0/1, exclude 255
+                    flat_labels = ood_gts[valid_mask].astype(np.uint8, copy=False).reshape(-1)
+                    flat_pred = amap_np[valid_mask].astype(np.float32, copy=False).reshape(-1)
+
+                    key = (float(T), method)
+                    if flat_labels.size > 0:
+                        acc[key]["labels"].append(flat_labels)
+                        acc[key]["pred"].append(flat_pred)
 
             processed += 1
 
