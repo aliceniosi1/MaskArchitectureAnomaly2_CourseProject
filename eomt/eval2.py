@@ -5,6 +5,7 @@ import os
 import glob
 import random
 import sys
+import csv
 from argparse import ArgumentParser
 from typing import Dict, List, Tuple
 
@@ -187,6 +188,10 @@ def main():
     )
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--max_images", type=int, default=-1, help="Debug. -1=tutte.")
+    parser.add_argument(
+        "--out_csv", type=str, default=None,
+        help="Path CSV output (opzionale). Se non specificato, non salva nulla."
+    )
     args = parser.parse_args()
 
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
@@ -293,10 +298,11 @@ def main():
     # Metrics via get_metrics (che hai già)
     # -------------------------------------------------------------------------
     print("\n=== RESULTS (Fishyscapes get_metrics) ===")
-    print("Method      Temp     |  AP(%)   AUROC(%)  FPR@95(%)")
-    print("---------------------------------------------------")
+    print("Method      Temp     |  AUPRC(%)   AUROC(%)  FPR@95(%)")
+    print("-------------------------------------------------------")
 
     best_by_method: Dict[str, Tuple[float, float]] = {}
+    rows: List[dict] = []
 
     for (T, method) in sorted(acc.keys(), key=lambda x: (x[1], x[0])):
         lab_list = acc[(T, method)]["labels"]
@@ -324,11 +330,60 @@ def main():
 
         print(f"{method:<10s} {T:<8.3f} | {ap:7.2f}  {auroc:8.2f}  {fpr95:9.2f}")
 
+        rows.append({
+            "method": str(method),
+            "temperature": float(T),
+            "AP_percent": float(ap),
+            "AUROC_percent": float(auroc),
+            "FPR95_percent": float(fpr95),
+            "n_pixels_valid": int(flat_labels.size),
+            "n_pos_pixels": int(n_pos),
+            "images_matched": int(len(img_paths)),
+            "images_processed": int(processed),
+            "images_without_ood": int(skipped_no_ood),
+            "errors": int(errors),
+            "weights": str(ckpt_path),
+            "img_size_h": int(IMG_SIZE[0]),
+            "img_size_w": int(IMG_SIZE[1]),
+        })
+
         if (method not in best_by_method) or (ap > best_by_method[method][1]):
             best_by_method[method] = (float(T), float(ap))
 
     for m, (bt, ba) in best_by_method.items():
-        print(f"\nBest T by AP for {m}: T={bt} (AP={ba:.2f}%)")
+        print(f"\nBest T by AUPRC for {m}: T={bt} (AP={ba:.2f}%)")
+
+    # ---------------------------------------------------------------------
+    # Save CSV (optional)
+    # ---------------------------------------------------------------------
+    if args.out_csv is not None:
+        out_csv = args.out_csv
+        out_dir = os.path.dirname(out_csv)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
+        # aggiungo info best per method in ogni riga
+        for r in rows:
+            m = r["method"]
+            best = best_by_method.get(m, (None, None))
+            r["best_T_by_AP_for_method"] = best[0]
+            r["best_AP_percent_for_method"] = best[1]
+
+        fieldnames = [
+            "method", "temperature",
+            "AP_percent", "AUROC_percent", "FPR95_percent",
+            "n_pixels_valid", "n_pos_pixels",
+            "images_matched", "images_processed", "images_without_ood", "errors",
+            "weights", "img_size_h", "img_size_w",
+            "best_T_by_AP_for_method", "best_AP_percent_for_method",
+        ]
+
+        with open(out_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+        print(f"\nCSV salvato in: {out_csv}")
 
 if __name__ == "__main__":
     main()
