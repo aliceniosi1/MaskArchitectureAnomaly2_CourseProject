@@ -60,6 +60,8 @@ class LightningModule(lightning.LightningModule):
         delta_weights=False,
         load_ckpt_class_head=True,
         train_class_head_only=False,
+        #unfreeze the class head and mask head for finetuning
+        train_class_mask_head_only = False
     ):
         super().__init__()
 
@@ -79,13 +81,20 @@ class LightningModule(lightning.LightningModule):
 
         self.strict_loading = False
         self.train_class_head_only = train_class_head_only
-        if self.train_class_head_only:
+        self.train_class_mask_head_only = train_class_mask_head_only
+        if self.train_class_head_only and self.train_class_mask_head_only:
+            raise ValueError("Choose only one: train_class_head_only OR train_class_mask_head_only.")
+        if self.train_class_head_only or self.train_class_mask_head_only:
         # freeze tutto
             for p in self.network.parameters():
                 p.requires_grad = False
             # unfreeze solo class_head
             for p in self.network.class_head.parameters():
                 p.requires_grad = True
+            if self.train_class_mask_head_only:
+                for p in self.network.mask_head.parameters():
+                    p.requires_grad = True
+
 
         if delta_weights and ckpt_path:
             logging.info("Delta weights mode")
