@@ -443,7 +443,7 @@ def main():
             axis=0
         )
 
-        prc_auc = aupr(val_label, val_out) * 100.0
+        prc_auc = aupr(val_out, val_label) * 100.0
         fpr95 = fpr_at_95_tpr(val_out, val_label) * 100.0
 
         # update best per method
