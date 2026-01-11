@@ -6,13 +6,14 @@ import glob
 import random
 import sys
 import csv
+from contextlib import nullcontext
 from argparse import ArgumentParser
 from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.amp import autocast
+from torch.amp.autocast_mode import autocast
 from PIL import Image
 from torchvision.transforms import Compose, Resize, ToTensor
 from compute_metrics import get_metrics
@@ -57,21 +58,10 @@ input_transform = Compose(
 
 IGNORE_LABEL = 255
 
-
-class _EvalDataCfg:
-    img_size = IMG_SIZE
-
-# will be overwritten in main if needed
-data = _EvalDataCfg()
-
-# will be set in main (infer_semantic relies on these globals)
-model = None
-device = None
-
 # -----------------------------------------------------------------------------
 # MODEL LOADER
 # -----------------------------------------------------------------------------
-def load_eomt_model(ckpt_path: str, device: torch.device) -> EoMT:
+def load_eomt_model(ckpt_path: str, device: torch.device) -> LightningModule:
     encoder = ViT(
         img_size=IMG_SIZE,
         backbone_name=BACKBONE_NAME,
@@ -103,9 +93,8 @@ def load_eomt_model(ckpt_path: str, device: torch.device) -> EoMT:
         load_ckpt_class_head=True,
     )
 
-    model = lm.network
-    model.to(device).eval()
-    return model
+    lm.to(device).eval()
+    return lm
 
 # -----------------------------------------------------------------------------
 # GT loader: tiene {0,1,255} invariato, converte RoadAnomaly {0,2} -> {0,1}
@@ -180,15 +169,16 @@ def anomaly_map_from_pixel_scores(
     raise ValueError(f"Unknown method: {method}")
 
 
-def infer_semantic(img, target, temperature: float = 1.0):
-    with torch.no_grad(), autocast(dtype=torch.float16, device_type="cuda"):
+def infer_semantic(img: torch.Tensor, model: LightningModule, device: torch.device, img_size, temperature: float = 1.0) -> torch.Tensor:
+    ctx = autocast(dtype=torch.float16, device_type="cuda") if device.type == "cuda" else nullcontext()
+    with torch.no_grad(), ctx:
         imgs = [img.to(device)]
         img_sizes = [img.shape[-2:] for img in imgs]
         crops, origins = model.window_imgs_semantic(imgs)
 
         mask_logits_per_layer, class_logits_per_layer = model(crops)
         mask_logits = F.interpolate(
-            mask_logits_per_layer[-1], data.img_size, mode="bilinear"
+            mask_logits_per_layer[-1], img_size, mode="bilinear", align_corners=False
         )
 
         crop_logits = model.to_per_pixel_logits_semantic(
@@ -196,7 +186,6 @@ def infer_semantic(img, target, temperature: float = 1.0):
         )
         logits = model.revert_window_logits_semantic(crop_logits, origins, img_sizes)
 
-   
     return logits
 
 # -----------------------------------------------------------------------------
@@ -231,14 +220,6 @@ def main():
     ckpt_path = os.path.join(args.loadDir, args.loadWeights)
     print("Loading EoMT checkpoint:", ckpt_path)
     model = load_eomt_model(ckpt_path, device)
-    # set globals used by infer_semantic()
-    globals()["model"] = model
-    globals()["device"] = device
-    globals()["data"].img_size = IMG_SIZE
-
-    if device.type != "cuda":
-        raise RuntimeError("infer_semantic() uses autocast(device_type='cuda'): run without --cpu and with CUDA available.")
-
     print("Model LOADED successfully (EoMT + DINOv2)")
 
     # Parse methods (accetto sia spazi che virgole)
@@ -277,7 +258,7 @@ def main():
     for idx, path in enumerate(img_paths, 1):
         try:
             img_pil = Image.open(path).convert("RGB")
-            images = input_transform(img_pil).unsqueeze(0).float().to(device)  # [1,3,H,W]
+            img = input_transform(img_pil).float().to(device)  # [3,H,W]
 
             ood_gts = load_ood_gt_from_img_path(path, out_size=IMG_SIZE)  # HxW
 
@@ -286,30 +267,27 @@ def main():
                 skipped_no_ood += 1
                 continue
 
-            # infer_semantic expects a single image tensor [3,H,W]
-            img_tensor = images[0]
-
             for T in temps:
-                logits = infer_semantic(img_tensor, target=None, temperature=T)
+                logits_bchw = infer_semantic(
+                    img=img,
+                    model=model,
+                    device=device,
+                    img_size=IMG_SIZE,
+                    temperature=T,
+                )
 
-                # logits can be Tensor [B,C,H,W] or list/tuple of tensors
-                if isinstance(logits, (list, tuple)):
-                    logits_t = logits[0]
-                else:
-                    logits_t = logits
+                # logits_bchw is expected to be [B, C, H, W] with B=1
+                pixel_scores = logits_bchw[0]
 
-                if logits_t.dim() == 4:
-                    logits_chw = logits_t[0]
-                elif logits_t.dim() == 3:
-                    logits_chw = logits_t
-                else:
-                    raise RuntimeError(f"Unexpected logits shape: {tuple(logits_t.shape)}")
+                # Some checkpoints/pipelines may include an extra void class
+                if pixel_scores.shape[0] == NUM_CLASSES + 1:
+                    pixel_scores = pixel_scores[:-1]
 
                 for method in methods:
-                    amap = anomaly_map_from_pixel_scores(logits_chw, method=method)  # [H,W]
+                    amap = anomaly_map_from_pixel_scores(pixel_scores, method=method)  # [H,W]
                     amap_np = amap.detach().cpu().numpy().astype(np.float32, copy=False)
 
-                    valid_mask = (ood_gts <= 1)  # 0/1, exclude 255
+                    valid_mask = (ood_gts <= 1)  # 0/1, escludo 255
                     flat_labels = ood_gts[valid_mask].astype(np.uint8, copy=False).reshape(-1)
                     flat_pred = amap_np[valid_mask].astype(np.float32, copy=False).reshape(-1)
 
@@ -323,7 +301,7 @@ def main():
             if idx % 10 == 0:
                 print(f"[{idx}/{len(img_paths)}] processed={processed} skipped_no_ood={skipped_no_ood} errors={errors}")
 
-            del images
+            del img
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
