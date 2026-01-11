@@ -85,7 +85,15 @@ def fpr_at_95_tpr(scores: np.ndarray, labels: np.ndarray) -> float:
     if len(idxs) == 0:
         return 1.0
     return float(np.min(fpr[idxs]))
-
+def fpr95_quantile(ind_scores: np.ndarray, ood_scores: np.ndarray):
+    """
+    Threshold thr = 5° percentile degli OOD scores  -> garantisce ~TPR=0.95
+    Poi FPR = frazione di IND con score >= thr
+    """
+    thr = float(np.quantile(ood_scores, 0.05))
+    fpr = float(np.mean(ind_scores >= thr))
+    tpr = float(np.mean(ood_scores >= thr))
+    return fpr, tpr, thr
 
 # -----------------------------------------------------------------------------
 # MODEL LOADER
@@ -458,7 +466,7 @@ def main():
         fpr95_min_val   = fpr_at_95_tpr(val_out, val_label) * 100.0
         fpr95_first_val = fpr95_first(val_out, val_label) * 100.0
         fpr95_int_val   = fpr95_interp(val_out, val_label) * 100.0
-
+        fpr_q, tpr_q, thr_q = fpr95_quantile(ind_out, ood_out)
         # sanity: medie/mediane
         mean_ood, mean_ind = float(ood_out.mean()), float(ind_out.mean())
         med_ood,  med_ind  = float(np.median(ood_out)), float(np.median(ind_out))
@@ -473,6 +481,7 @@ def main():
             f"FPR95(min) {fpr95_min_val:6.2f} | "
             f"FPR95(first) {fpr95_first_val:6.2f} | "
             f"FPR95(int) {fpr95_int_val:6.2f} | "
+            f"FPR95(q) {fpr_q*100:6.2f} (TPR={tpr_q:.3f}, thr={thr_q:.4f}) | "
             f"mean(ood/ind) {mean_ood:.4f}/{mean_ind:.4f} | "
             f"med(ood/ind) {med_ood:.4f}/{med_ind:.4f} | "
             f"dir_ok {direction_ok} | "
