@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from PIL import Image
 #from sklearn.metrics import average_precision_score, roc_curve
 from torchvision.transforms import Compose, Resize, ToTensor
-from ood_metrics import fpr_at_95_tpr, auprc_score
+from ood_metrics import fpr_at_95_tpr, aupr
 
 # -----------------------------------------------------------------------------
 # IMPORT EoMT (aggiungo la cartella eomt al PYTHONPATH)
@@ -443,7 +443,7 @@ def main():
             axis=0
         )
 
-        prc_auc = auprc_score(val_label, val_out) * 100.0
+        prc_auc = aupr(val_label, val_out) * 100.0
         fpr95 = fpr_at_95_tpr(val_out, val_label) * 100.0
 
         # update best per method
