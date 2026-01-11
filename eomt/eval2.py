@@ -6,14 +6,12 @@ import glob
 import random
 import sys
 import csv
-from contextlib import nullcontext
 from argparse import ArgumentParser
 from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.amp.autocast_mode import autocast
 from PIL import Image
 from torchvision.transforms import Compose, Resize, ToTensor
 from compute_metrics import get_metrics
@@ -61,7 +59,7 @@ IGNORE_LABEL = 255
 # -----------------------------------------------------------------------------
 # MODEL LOADER
 # -----------------------------------------------------------------------------
-def load_eomt_model(ckpt_path: str, device: torch.device) -> LightningModule:
+def load_eomt_model(ckpt_path: str, device: torch.device) -> EoMT:
     encoder = ViT(
         img_size=IMG_SIZE,
         backbone_name=BACKBONE_NAME,
@@ -93,8 +91,9 @@ def load_eomt_model(ckpt_path: str, device: torch.device) -> LightningModule:
         load_ckpt_class_head=True,
     )
 
-    lm.to(device).eval()
-    return lm
+    model = lm.network
+    model.to(device).eval()
+    return model
 
 # -----------------------------------------------------------------------------
 # GT loader: tiene {0,1,255} invariato, converte RoadAnomaly {0,2} -> {0,1}
@@ -169,25 +168,6 @@ def anomaly_map_from_pixel_scores(
     raise ValueError(f"Unknown method: {method}")
 
 
-def infer_semantic(img: torch.Tensor, model: LightningModule, device: torch.device, img_size, temperature: float = 1.0) -> torch.Tensor:
-    ctx = autocast(dtype=torch.float16, device_type="cuda") if device.type == "cuda" else nullcontext()
-    with torch.no_grad(), ctx:
-        imgs = [img.to(device)]
-        img_sizes = [img.shape[-2:] for img in imgs]
-        crops, origins = model.window_imgs_semantic(imgs)
-
-        mask_logits_per_layer, class_logits_per_layer = model(crops)
-        mask_logits = F.interpolate(
-            mask_logits_per_layer[-1], img_size, mode="bilinear", align_corners=False
-        )
-
-        crop_logits = model.to_per_pixel_logits_semantic(
-            mask_logits, class_logits_per_layer[-1] / float(temperature)
-        )
-        logits = model.revert_window_logits_semantic(crop_logits, origins, img_sizes)
-
-    return logits
-
 # -----------------------------------------------------------------------------
 # MAIN
 # -----------------------------------------------------------------------------
@@ -258,7 +238,7 @@ def main():
     for idx, path in enumerate(img_paths, 1):
         try:
             img_pil = Image.open(path).convert("RGB")
-            img = input_transform(img_pil).float().to(device)  # [3,H,W]
+            images = input_transform(img_pil).unsqueeze(0).float().to(device)  # [1,3,H,W]
 
             ood_gts = load_ood_gt_from_img_path(path, out_size=IMG_SIZE)  # HxW
 
@@ -267,41 +247,43 @@ def main():
                 skipped_no_ood += 1
                 continue
 
-            for T in temps:
-                logits_bchw = infer_semantic(
-                    img=img,
-                    model=model,
-                    device=device,
-                    img_size=IMG_SIZE,
-                    temperature=T,
+            with torch.no_grad():
+                mask_logits_per_layer, class_logits_per_layer = model(images)
+                mask_logits = mask_logits_per_layer[-1]    # [B,Q,h,w]
+                class_logits = class_logits_per_layer[-1]  # [B,Q,C+1]
+
+                # upsample masks -> IMG_SIZE
+                mask_logits = F.interpolate(
+                    mask_logits, size=IMG_SIZE, mode="bilinear", align_corners=False
                 )
 
-                # logits_bchw is expected to be [B, C, H, W] with B=1
-                pixel_scores = logits_bchw[0]
+                for T in temps:
+                    pixel_scores_bchw = per_pixel_scores_with_temperature(
+                        mask_logits=mask_logits,
+                        class_logits=class_logits,
+                        temperature=T,
+                    )
+                    pixel_scores = pixel_scores_bchw[0]  # [C,H,W]
 
-                # Some checkpoints/pipelines may include an extra void class
-                if pixel_scores.shape[0] == NUM_CLASSES + 1:
-                    pixel_scores = pixel_scores[:-1]
+                    for method in methods:
+                        amap = anomaly_map_from_pixel_scores(pixel_scores, method=method)  # [H,W]
+                        amap_np = amap.detach().cpu().numpy().astype(np.float32, copy=False)
 
-                for method in methods:
-                    amap = anomaly_map_from_pixel_scores(pixel_scores, method=method)  # [H,W]
-                    amap_np = amap.detach().cpu().numpy().astype(np.float32, copy=False)
+                        valid_mask = (ood_gts <= 1)  # 0/1, escludo 255
+                        flat_labels = ood_gts[valid_mask].astype(np.uint8, copy=False).reshape(-1)
+                        flat_pred = amap_np[valid_mask].astype(np.float32, copy=False).reshape(-1)
 
-                    valid_mask = (ood_gts <= 1)  # 0/1, escludo 255
-                    flat_labels = ood_gts[valid_mask].astype(np.uint8, copy=False).reshape(-1)
-                    flat_pred = amap_np[valid_mask].astype(np.float32, copy=False).reshape(-1)
-
-                    key = (float(T), method)
-                    if flat_labels.size > 0:
-                        acc[key]["labels"].append(flat_labels)
-                        acc[key]["pred"].append(flat_pred)
+                        key = (float(T), method)
+                        if flat_labels.size > 0:
+                            acc[key]["labels"].append(flat_labels)
+                            acc[key]["pred"].append(flat_pred)
 
             processed += 1
 
             if idx % 10 == 0:
                 print(f"[{idx}/{len(img_paths)}] processed={processed} skipped_no_ood={skipped_no_ood} errors={errors}")
 
-            del img
+            del images
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
