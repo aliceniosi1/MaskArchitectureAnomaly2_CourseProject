@@ -91,7 +91,7 @@ class LightningModule(lightning.LightningModule):
         ]
         if sum(bool(m) for m in modes) > 1:
             raise ValueError("Choose only one finetune mode among: class_head_only, class_mask_head_only, queries+class_head.")
-        if self.train_class_head_only or self.train_class_mask_head_only or self._queries_class_head_only:
+        if self.train_class_head_only or self.train_class_mask_head_only or self.train_queries_class_head_only:
         # freeze tutto
             for p in self.network.parameters():
                 p.requires_grad = False
