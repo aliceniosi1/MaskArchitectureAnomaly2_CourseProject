@@ -13,9 +13,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-#from sklearn.metrics import average_precision_score, roc_curve
+from sklearn.metrics import average_precision_score, roc_curve
 from torchvision.transforms import Compose, Resize, ToTensor
-from ood_metrics import fpr_at_95_tpr, aupr
 
 # -----------------------------------------------------------------------------
 # IMPORT EoMT (aggiungo la cartella eomt al PYTHONPATH)
@@ -67,8 +66,18 @@ IGNORE_LABEL = 255
 # -----------------------------------------------------------------------------
 # METRICA FPR@95TPR (prendo il minimo FPR tra i punti con TPR>=0.95)
 # -----------------------------------------------------------------------------
+def fpr95_first(scores, labels):
+    fpr, tpr, _ = roc_curve(labels, scores, pos_label=1)
+    idxs = np.where(tpr >= 0.95)[0]
+    return 1.0 if len(idxs) == 0 else float(fpr[idxs[0]])
 
-"""
+def fpr95_interp(scores, labels):
+    fpr, tpr, _ = roc_curve(labels, scores, pos_label=1)
+    if tpr.max() < 0.95:
+        return 1.0
+    order = np.argsort(tpr)
+    return float(np.interp(0.95, tpr[order], fpr[order]))
+
 def fpr_at_95_tpr(scores: np.ndarray, labels: np.ndarray) -> float:
    
     fpr, tpr, _ = roc_curve(labels, scores, pos_label=1)
@@ -76,7 +85,7 @@ def fpr_at_95_tpr(scores: np.ndarray, labels: np.ndarray) -> float:
     if len(idxs) == 0:
         return 1.0
     return float(np.min(fpr[idxs]))
-"""
+
 
 # -----------------------------------------------------------------------------
 # MODEL LOADER
@@ -416,7 +425,8 @@ def main():
     # Compute metrics and print tables
     # -------------------------------------------------------------------------
     print("\n=== RESULTS (Temperature Scaling) ===")
-    print("Method      Temp     |  AuPRC (%) | FPR@95 (%)")
+    #print("Method      Temp     |  AuPRC (%) | FPR@95 (%)")
+    print("Method      Temp     | AuPRC | FPR95(min) | FPR95(first) | FPR95(int) | mean(ood/ind) | med(ood/ind)")
     print("------------------------------------------------")
 
     best_by_method: Dict[str, Tuple[float, float]] = {}  # method -> (best_T, best_auprc)
@@ -443,15 +453,38 @@ def main():
             axis=0
         )
 
-        prc_auc = aupr(val_out, val_label) * 100.0
-        fpr95 = fpr_at_95_tpr(val_out, val_label) * 100.0
+        prc_auc = average_precision_score(val_label, val_out) * 100.0
+
+        fpr95_min_val   = fpr_at_95_tpr(val_out, val_label) * 100.0
+        fpr95_first_val = fpr95_first(val_out, val_label) * 100.0
+        fpr95_int_val   = fpr95_interp(val_out, val_label) * 100.0
+
+        # sanity: medie/mediane
+        mean_ood, mean_ind = float(ood_out.mean()), float(ind_out.mean())
+        med_ood,  med_ind  = float(np.median(ood_out)), float(np.median(ind_out))
+        direction_ok = (mean_ood > mean_ind) and (med_ood > med_ind)
+
+        p95_ind = float(np.percentile(ind_out, 95))
+        p05_ood = float(np.percentile(ood_out, 5))
+        #print("direction_ok:", direction_ok)
+        print(
+            f"{method:<10s} {T:<8.3f} | "
+            f"AuPRC {prc_auc:6.2f} | "
+            f"FPR95(min) {fpr95_min_val:6.2f} | "
+            f"FPR95(first) {fpr95_first_val:6.2f} | "
+            f"FPR95(int) {fpr95_int_val:6.2f} | "
+            f"mean(ood/ind) {mean_ood:.4f}/{mean_ind:.4f} | "
+            f"med(ood/ind) {med_ood:.4f}/{med_ind:.4f} | "
+            f"dir_ok {direction_ok} | "
+            f"p95(ind) {p95_ind:.4f} | p05(ood) {p05_ood:.4f}"
+        )
 
         # update best per method
         if (method not in best_by_method) or (prc_auc > best_by_method[method][1]):
             best_by_method[method] = (float(T), float(prc_auc))
 
-        print(f"{method:<10s} {T:<8.3f} | {prc_auc:10.2f} | {fpr95:9.2f}")
-
+        #print(f"{method:<10s} {T:<8.3f} | {prc_auc:10.2f} | {fpr95:9.2f}")
+        """
         rows.append({
             "method": str(method),
             "temperature": float(T),
@@ -467,13 +500,14 @@ def main():
             "img_size_h": int(IMG_SIZE[0]),
             "img_size_w": int(IMG_SIZE[1]),
         })
-
+        """
     for m, (bt, ba) in best_by_method.items():
         print(f"\nBest T by AuPRC for {m}: T={bt} (AuPRC={ba:.2f}%)")
 
     # -------------------------------------------------------------------------
     # Save CSV
     # -------------------------------------------------------------------------
+    """
     if args.out_csv is not None:
         out_csv = args.out_csv
         out_dir = os.path.dirname(out_csv)
@@ -500,7 +534,7 @@ def main():
             writer.writerows(rows)
 
         print(f"\nCSV salvato in: {out_csv}")
-
+        """
 
 if __name__ == "__main__":
     main()
