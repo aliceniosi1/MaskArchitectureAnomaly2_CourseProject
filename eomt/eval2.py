@@ -5,7 +5,6 @@ import os
 import glob
 import random
 import sys
-import csv
 from argparse import ArgumentParser
 from typing import Dict, List, Tuple
 
@@ -13,8 +12,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from sklearn.metrics import average_precision_score, roc_curve
 from torchvision.transforms import Compose, Resize, ToTensor
+from compute_metrics import get_metrics
 
 # -----------------------------------------------------------------------------
 # IMPORT EoMT (aggiungo la cartella eomt al PYTHONPATH)
@@ -31,7 +30,7 @@ from models.eomt import EoMT
 from training.lightning_module import LightningModule
 
 # -----------------------------------------------------------------------------
-# CONFIG DI BASE (coerente con CityscapesSemantic / EoMT base_640, adattata al tuo eval)
+# CONFIG DI BASE
 # -----------------------------------------------------------------------------
 seed = 42
 random.seed(seed)
@@ -50,59 +49,16 @@ torch.backends.cudnn.benchmark = True
 input_transform = Compose(
     [
         Resize(IMG_SIZE, Image.BILINEAR),
-        ToTensor(),  # -> float in [0,1]
-    ]
-)
-
-target_transform = Compose(
-    [
-        Resize(IMG_SIZE, Image.NEAREST),
+        ToTensor(),
     ]
 )
 
 IGNORE_LABEL = 255
 
-
-# -----------------------------------------------------------------------------
-# METRICA FPR@95TPR (prendo il minimo FPR tra i punti con TPR>=0.95)
-# -----------------------------------------------------------------------------
-def fpr95_first(scores, labels):
-    fpr, tpr, _ = roc_curve(labels, scores, pos_label=1)
-    idxs = np.where(tpr >= 0.95)[0]
-    return 1.0 if len(idxs) == 0 else float(fpr[idxs[0]])
-
-def fpr95_interp(scores, labels):
-    fpr, tpr, _ = roc_curve(labels, scores, pos_label=1)
-    if tpr.max() < 0.95:
-        return 1.0
-    order = np.argsort(tpr)
-    return float(np.interp(0.95, tpr[order], fpr[order]))
-
-def fpr_at_95_tpr(scores: np.ndarray, labels: np.ndarray) -> float:
-   
-    fpr, tpr, _ = roc_curve(labels, scores, pos_label=1)
-    idxs = np.where(tpr >= 0.95)[0]
-    if len(idxs) == 0:
-        return 1.0
-    return float(np.min(fpr[idxs]))
-def fpr95_quantile(ind_scores: np.ndarray, ood_scores: np.ndarray):
-    """
-    Threshold thr = 5° percentile degli OOD scores  -> garantisce ~TPR=0.95
-    Poi FPR = frazione di IND con score >= thr
-    """
-    thr = float(np.quantile(ood_scores, 0.05))
-    fpr = float(np.mean(ind_scores >= thr))
-    tpr = float(np.mean(ood_scores >= thr))
-    return fpr, tpr, thr
-
 # -----------------------------------------------------------------------------
 # MODEL LOADER
 # -----------------------------------------------------------------------------
 def load_eomt_model(ckpt_path: str, device: torch.device) -> EoMT:
-    """
-    Nota: in questo progetto spesso ckpt_path può essere sia .ckpt sia .bin
-    (perché LightningModule gestisce ckpt_path internamente).
-    """
     encoder = ViT(
         img_size=IMG_SIZE,
         backbone_name=BACKBONE_NAME,
@@ -115,7 +71,6 @@ def load_eomt_model(ckpt_path: str, device: torch.device) -> EoMT:
         masked_attn_enabled=True,
     )
 
-    # LightningModule usato solo per caricare facilmente i pesi nel network
     lm = LightningModule(
         network=network,
         img_size=IMG_SIZE,
@@ -139,115 +94,65 @@ def load_eomt_model(ckpt_path: str, device: torch.device) -> EoMT:
     model.to(device).eval()
     return model
 
-
 # -----------------------------------------------------------------------------
-# GT loading + normalization (robusta) -> output sempre {0,1,255}
+# GT loader: tiene {0,1,255} invariato, converte RoadAnomaly {0,2} -> {0,1}
 # -----------------------------------------------------------------------------
-def load_ood_gt_from_img_path11(img_path: str) -> np.ndarray:
-    """
-    Restituisce una mappa HxW con valori:
-      1 = OOD
-      0 = IND
-      255 = IGNORE (se presente)
-    """
-    pathGT = img_path.replace("images", "labels_masks")
-
-    # estensioni tipiche
-    lower = pathGT.lower()
-    if "roadobsticle21" in lower or "roadobstacle21" in lower or "roadanomaly21" in lower:
-        pathGT = os.path.splitext(pathGT)[0] + ".png"
-    if "fs_static" in lower:
-        pathGT = os.path.splitext(pathGT)[0] + ".png"
-    if "roadanomaly" in lower:
-        pathGT = os.path.splitext(pathGT)[0] + ".png"
-
-    mask = Image.open(pathGT)
-    mask = target_transform(mask)
-    ood_gts = np.array(mask)
-
-    # --- Regole storiche (come nei tuoi script) ---
-    # RoadAnomaly (vecchio): spesso {0,2} dove 2=OOD
-    uniq = np.unique(ood_gts)
-    if 2 in uniq and 1 not in uniq:
-        ood_gts = np.where(ood_gts == 2, 1, 0).astype(np.uint8)
-
-    # LostAndFound (se usi quella versione legacy)
-    if "lostandfound" in pathGT.lower():
-        ood_gts = np.where((ood_gts == 0), 255, ood_gts)
-        ood_gts = np.where((ood_gts == 1), 0, ood_gts)
-        ood_gts = np.where((ood_gts > 1) & (ood_gts < 201), 1, ood_gts).astype(np.uint8)
-
-    # Streethazard legacy
-    if "streethazard" in pathGT.lower():
-        ood_gts = np.where((ood_gts == 14), 255, ood_gts)
-        ood_gts = np.where((ood_gts < 20), 0, ood_gts)
-        ood_gts = np.where((ood_gts == 255), 1, ood_gts).astype(np.uint8)
-
-    return ood_gts
-
 def load_ood_gt_from_img_path(img_path: str, out_size=None) -> np.ndarray:
     pathGT = img_path.replace("images", "labels_masks")
     pathGT = os.path.splitext(pathGT)[0] + ".png"
 
     gt_pil = Image.open(pathGT).convert("L")
+
+    # Se ridimensioni le immagini in input, ridimensiona anche la GT per allinearla
     if out_size is not None:
-        gt_pil = gt_pil.resize((out_size[1], out_size[0]), resample=Image.NEAREST)
+        gt_pil = gt_pil.resize((out_size[1], out_size[0]), resample=Image.NEAREST)  # (W,H)
 
     gt = np.array(gt_pil)
     uniq = set(np.unique(gt).tolist())
 
-    if uniq.issubset({0, 2}) and (2 in uniq):
+    # RoadAnomaly: {0,2} con 2=OOD
+    if uniq.issubset({0, 2}):
         out = np.zeros_like(gt, dtype=np.uint8)
         out[gt == 2] = 1
         return out
 
+    # Standard: {0,1,255}
     if uniq.issubset({0, 1, 255}):
         return gt.astype(np.uint8, copy=False)
-    raise ValueError(f"Unexpected GT values {sorted(uniq)} in {pathGT}")
-   
 
+    # Alcuni casi possono essere {0,255} (immagini senza OOD)
+    if uniq.issubset({0, 255}):
+        return gt.astype(np.uint8, copy=False)
+
+    raise ValueError(f"Unexpected GT values {sorted(uniq)} in {pathGT}")
 
 # -----------------------------------------------------------------------------
 # Combine (mask_logits, class_logits) with temperature on class logits
 # -----------------------------------------------------------------------------
 @torch.no_grad()
 def per_pixel_scores_with_temperature(
-    mask_logits: torch.Tensor,   # [B,Q,h,w]
+    mask_logits: torch.Tensor,   # [B,Q,H,W]
     class_logits: torch.Tensor,  # [B,Q,C+1]
     temperature: float,
 ) -> torch.Tensor:
-    """
-    Temperature scaling SOLO sui class logits:
-      class_probs_T = softmax(class_logits / T)
-      pixel_scores  = einsum(sigmoid(mask_logits), class_probs_T[...,:-1])
-
-    Output: [B,C,H,W] (>=0, non normalizzato)
-    """
     if temperature <= 0:
         raise ValueError("temperature must be > 0")
 
-    mask_probs = mask_logits.sigmoid()  # [B,Q,H,W] in [0,1]
-    class_probs = torch.softmax(class_logits / temperature, dim=-1)[..., :-1]  # [B,Q,C]
+    mask_probs = mask_logits.sigmoid()
+    class_probs = torch.softmax(class_logits / temperature, dim=-1)[..., :-1]  # drop void class
 
     pixel_scores = torch.einsum("bqhw,bqc->bchw", mask_probs, class_probs)
     return pixel_scores
-
 
 # -----------------------------------------------------------------------------
 # OOD scoring methods from pixel scores
 # -----------------------------------------------------------------------------
 @torch.no_grad()
-def anomaly_map_from_pixel_scores(pixel_scores_chw: torch.Tensor, method: str, eps: float = 1e-8) -> torch.Tensor:
-    """
-    pixel_scores_chw: [C,H,W] (>=0)
-    method:
-      - msp        : 1 - max softmax(pixel_scores)
-      - maxentropy : entropy(softmax(pixel_scores))
-      - maxlogit   : -max(pixel_scores)
-    """
+def anomaly_map_from_pixel_scores(
+    pixel_scores_chw: torch.Tensor, method: str, eps: float = 1e-8
+) -> torch.Tensor:
     method = method.lower()
-
-    probs = torch.softmax(pixel_scores_chw, dim=0)  # [C,H,W]
+    probs = torch.softmax(pixel_scores_chw, dim=0)
 
     if method == "msp":
         return 1.0 - probs.max(dim=0).values
@@ -260,7 +165,6 @@ def anomaly_map_from_pixel_scores(pixel_scores_chw: torch.Tensor, method: str, e
         return -pixel_scores_chw.max(dim=0).values
 
     raise ValueError(f"Unknown method: {method}")
-
 
 # -----------------------------------------------------------------------------
 # MAIN
@@ -282,11 +186,7 @@ def main():
         help="Metodi OOD: msp maxentropy maxlogit. Accetto anche virgole: --methods msp,maxentropy"
     )
     parser.add_argument("--cpu", action="store_true")
-    parser.add_argument("--max_images", type=int, default=-1, help="Per debug. -1 = tutte.")
-    parser.add_argument(
-        "--out_csv", type=str, default=None,
-        help="Path CSV output. Se non specificato, non salva nulla."
-    )
+    parser.add_argument("--max_images", type=int, default=-1, help="Debug. -1=tutte.")
     args = parser.parse_args()
 
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
@@ -301,7 +201,6 @@ def main():
     for m in args.methods:
         methods.extend([x.strip() for x in str(m).split(",") if x.strip()])
     methods = [m.lower() for m in methods]
-
     temps = [float(t) for t in args.temperatures]
 
     print("Device:", device)
@@ -321,9 +220,9 @@ def main():
     if args.max_images > 0:
         img_paths = img_paths[: args.max_images]
 
-    # Accumulator: scores[(T,method)] -> {"ood": [...], "ind": [...]}
-    scores: Dict[Tuple[float, str], Dict[str, List[np.ndarray]]] = {
-        (float(t), m): {"ood": [], "ind": []} for t in temps for m in methods
+    # Accumulator per get_metrics: per (T,method) salvo labels/pred flatten (solo valid 0/1)
+    acc: Dict[Tuple[float, str], Dict[str, List[np.ndarray]]] = {
+        (float(t), m): {"labels": [], "pred": []} for t in temps for m in methods
     }
 
     processed = 0
@@ -332,26 +231,20 @@ def main():
 
     for idx, path in enumerate(img_paths, 1):
         try:
-            # --- image ---
             img_pil = Image.open(path).convert("RGB")
             images = input_transform(img_pil).unsqueeze(0).float().to(device)  # [1,3,H,W]
 
-            # --- gt ---
-            ood_gts = load_ood_gt_from_img_path(path, out_size=IMG_SIZE)  # HxW in {0,1,255}
+            ood_gts = load_ood_gt_from_img_path(path, out_size=IMG_SIZE)  # HxW
 
-            # Masks
-            ood_mask = (ood_gts == 1)
-            ind_mask = (ood_gts == 0)
-
-            if not ood_mask.any():
+            if not (ood_gts == 1).any():
                 skipped_no_ood += 1
 
             with torch.no_grad():
                 mask_logits_per_layer, class_logits_per_layer = model(images)
-                mask_logits = mask_logits_per_layer[-1]   # [B,Q,h,w]
-                class_logits = class_logits_per_layer[-1] # [B,Q,C+1]
+                mask_logits = mask_logits_per_layer[-1]    # [B,Q,h,w]
+                class_logits = class_logits_per_layer[-1]  # [B,Q,C+1]
 
-                # upscale masks to IMG_SIZE
+                # upsample masks -> IMG_SIZE
                 mask_logits = F.interpolate(
                     mask_logits, size=IMG_SIZE, mode="bilinear", align_corners=False
                 )
@@ -366,16 +259,16 @@ def main():
 
                     for method in methods:
                         amap = anomaly_map_from_pixel_scores(pixel_scores, method=method)  # [H,W]
-                        amap_np = amap.detach().cpu().numpy().astype(np.float32)
+                        amap_np = amap.detach().cpu().numpy().astype(np.float32, copy=False)
 
-                        ood_vals = amap_np[ood_mask]
-                        ind_vals = amap_np[ind_mask]
+                        valid_mask = (ood_gts <= 1)  # 0/1, escludo 255
+                        flat_labels = ood_gts[valid_mask].astype(np.uint8, copy=False).reshape(-1)
+                        flat_pred = amap_np[valid_mask].astype(np.float32, copy=False).reshape(-1)
 
                         key = (float(T), method)
-                        if ood_vals.size > 0:
-                            scores[key]["ood"].append(ood_vals)
-                        if ind_vals.size > 0:
-                            scores[key]["ind"].append(ind_vals)
+                        if flat_labels.size > 0:
+                            acc[key]["labels"].append(flat_labels)
+                            acc[key]["pred"].append(flat_pred)
 
             processed += 1
 
@@ -397,110 +290,45 @@ def main():
     print(f"Errors:              {errors}")
 
     # -------------------------------------------------------------------------
-    # Compute metrics and print tables
+    # Metrics via get_metrics (che hai già)
     # -------------------------------------------------------------------------
-    print("\n=== RESULTS (Temperature Scaling) ===")
-    #print("Method      Temp     |  AuPRC (%) | FPR@95 (%)")
-    print("Method      Temp     | AuPRC | FPR95(min) | FPR95(first) | FPR95(int) | mean(ood/ind) | med(ood/ind)")
-    print("------------------------------------------------")
+    print("\n=== RESULTS (Fishyscapes get_metrics) ===")
+    print("Method      Temp     |  AP(%)   AUROC(%)  FPR@95(%)")
+    print("---------------------------------------------------")
 
-    best_by_method: Dict[str, Tuple[float, float]] = {}  # method -> (best_T, best_auprc)
-    rows: List[dict] = []
+    best_by_method: Dict[str, Tuple[float, float]] = {}
 
-    for (T, method) in sorted(scores.keys(), key=lambda x: (x[1], x[0])):
-        ood_list = scores[(T, method)]["ood"]
-        ind_list = scores[(T, method)]["ind"]
+    for (T, method) in sorted(acc.keys(), key=lambda x: (x[1], x[0])):
+        lab_list = acc[(T, method)]["labels"]
+        pred_list = acc[(T, method)]["pred"]
 
-        if len(ind_list) == 0 or len(ood_list) == 0:
-            print(f"{method:<10s} {T:<8.3f} |   (no data) |   (no data)")
+        if len(lab_list) == 0:
+            print(f"{method:<10s} {T:<8.3f} | (no valid pixels)")
             continue
 
-        ind_out = np.concatenate(ind_list, axis=0)
-        ood_out = np.concatenate(ood_list, axis=0)
+        flat_labels = np.concatenate(lab_list, axis=0)
+        flat_pred = np.concatenate(pred_list, axis=0)
 
-        if ind_out.size == 0 or ood_out.size == 0:
-            print(f"{method:<10s} {T:<8.3f} |   (no data) |   (no data)")
+        # Se non ci sono positivi in tutto il set, AP/FPR@95 non sono definiti
+        n_pos = int(np.sum(flat_labels == 1))
+        if n_pos == 0:
+            print(f"{method:<10s} {T:<8.3f} | (no positives in GT)")
             continue
 
-        val_out = np.concatenate((ind_out, ood_out), axis=0)
-        val_label = np.concatenate(
-            (np.zeros_like(ind_out, dtype=np.uint8), np.ones_like(ood_out, dtype=np.uint8)),
-            axis=0
-        )
+        # get_metrics deve essere definita/importata da te (tu hai già la funzione)
+        res = get_metrics(flat_labels, flat_pred, num_points=50)
 
-        prc_auc = average_precision_score(val_label, val_out) * 100.0
+        ap = float(res["AP"]) * 100.0
+        auroc = float(res["auroc"]) * 100.0
+        fpr95 = float(res["FPR@95%TPR"]) * 100.0
 
-    
-        fpr95_int_val   = fpr95_interp(val_out, val_label) * 100.0
-        
-        mean_ood, mean_ind = float(ood_out.mean()), float(ind_out.mean())
-        med_ood,  med_ind  = float(np.median(ood_out)), float(np.median(ind_out))
-        
+        print(f"{method:<10s} {T:<8.3f} | {ap:7.2f}  {auroc:8.2f}  {fpr95:9.2f}")
 
-        #print("direction_ok:", direction_ok)
-        print(
-            f"{method:<10s} {T:<8.3f} | "
-            f"AuPRC {prc_auc:6.2f} | "
-            f"FPR95(int) {fpr95_int_val:6.2f} | "
-            
-        )
+        if (method not in best_by_method) or (ap > best_by_method[method][1]):
+            best_by_method[method] = (float(T), float(ap))
 
-        # update best per method
-        if (method not in best_by_method) or (prc_auc > best_by_method[method][1]):
-            best_by_method[method] = (float(T), float(prc_auc))
-
-        #print(f"{method:<10s} {T:<8.3f} | {prc_auc:10.2f} | {fpr95:9.2f}")
-        """
-        rows.append({
-            "method": str(method),
-            "temperature": float(T),
-            "auprc_percent": float(prc_auc),
-            "fpr95_percent": float(fpr95),
-            "n_ind_pixels": int(ind_out.size),
-            "n_ood_pixels": int(ood_out.size),
-            "images_matched": int(len(img_paths)),
-            "images_processed": int(processed),
-            "images_without_ood": int(skipped_no_ood),
-            "errors": int(errors),
-            "weights": str(ckpt_path),
-            "img_size_h": int(IMG_SIZE[0]),
-            "img_size_w": int(IMG_SIZE[1]),
-        })
-        """
     for m, (bt, ba) in best_by_method.items():
-        print(f"\nBest T by AuPRC for {m}: T={bt} (AuPRC={ba:.2f}%)")
-
-    # -------------------------------------------------------------------------
-    # Save CSV
-    # -------------------------------------------------------------------------
-    """
-    if args.out_csv is not None:
-        out_csv = args.out_csv
-        out_dir = os.path.dirname(out_csv)
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-
-        # aggiungo best_T per method in ogni riga (comodo per leggere il CSV)
-        for r in rows:
-            m = r["method"]
-            r["best_T_by_auprc_for_method"] = best_by_method.get(m, ("", ""))[0]
-            r["best_auprc_for_method"] = best_by_method.get(m, ("", ""))[1]
-
-        fieldnames = [
-            "method", "temperature", "auprc_percent", "fpr95_percent",
-            "n_ind_pixels", "n_ood_pixels",
-            "images_matched", "images_processed", "images_without_ood", "errors",
-            "weights", "img_size_h", "img_size_w",
-            "best_T_by_auprc_for_method", "best_auprc_for_method",
-        ]
-
-        with open(out_csv, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
-
-        print(f"\nCSV salvato in: {out_csv}")
-        """
+        print(f"\nBest T by AP for {m}: T={bt} (AP={ba:.2f}%)")
 
 if __name__ == "__main__":
     main()
