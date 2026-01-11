@@ -26,6 +26,7 @@ model:
     logit_norm_eps: 1e-6
     train_class_head_only: false
     train_class_mask_head_only : true
+    train_queries_class_head_only: false
     network:
       class_path: models.eomt.EoMT
       init_args:

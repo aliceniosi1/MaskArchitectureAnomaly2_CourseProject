@@ -48,6 +48,7 @@ class MaskClassificationSemantic(LightningModule):
         #fine-tuning
         train_class_head_only: bool = False,
         train_class_mask_head_only : bool = False,
+        train_queries_class_head_only: bool = False,
     ):
         super().__init__(
             network=network,
@@ -68,6 +69,7 @@ class MaskClassificationSemantic(LightningModule):
             load_ckpt_class_head=load_ckpt_class_head,
             train_class_head_only=train_class_head_only,
             train_class_mask_head_only=train_class_mask_head_only,
+            train_queries_class_head_only= train_queries_class_head_only,
         )
 
         self.save_hyperparameters(ignore=["_class_path"])

@@ -61,7 +61,8 @@ class LightningModule(lightning.LightningModule):
         load_ckpt_class_head=True,
         train_class_head_only=False,
         #unfreeze the class head and mask head for finetuning
-        train_class_mask_head_only = False
+        train_class_mask_head_only = False,
+        train_queries_class_head_only=False
     ):
         super().__init__()
 
@@ -82,9 +83,15 @@ class LightningModule(lightning.LightningModule):
         self.strict_loading = False
         self.train_class_head_only = train_class_head_only
         self.train_class_mask_head_only = train_class_mask_head_only
-        if self.train_class_head_only and self.train_class_mask_head_only:
-            raise ValueError("Choose only one: train_class_head_only OR train_class_mask_head_only.")
-        if self.train_class_head_only or self.train_class_mask_head_only:
+        self.train_queries_class_head_only = train_queries_class_head_only
+        modes = [
+            self.train_class_head_only,
+            self.train_class_mask_head_only,
+            self.train_queries_class_head_only,
+        ]
+        if sum(bool(m) for m in modes) > 1:
+            raise ValueError("Choose only one finetune mode among: class_head_only, class_mask_head_only, queries+class_head.")
+        if self.train_class_head_only or self.train_class_mask_head_only or self._queries_class_head_only:
         # freeze tutto
             for p in self.network.parameters():
                 p.requires_grad = False
@@ -94,8 +101,12 @@ class LightningModule(lightning.LightningModule):
             if self.train_class_mask_head_only:
                 for p in self.network.mask_head.parameters():
                     p.requires_grad = True
-
-
+            if self.train_queries_class_head_only:
+                if hasattr(self.network.q, "parameters"):
+                    for p in self.network.q.parameters():
+                        p.requires_grad = True
+                else:
+                    self.network.q.requires_grad_(True)
         if delta_weights and ckpt_path:
             logging.info("Delta weights mode")
             self._zero_init_outside_encoder(skip_class_head=not load_ckpt_class_head)
