@@ -185,59 +185,30 @@ def load_ood_gt_from_img_path11(img_path: str) -> np.ndarray:
 
     return ood_gts
 
-def load_ood_gt_from_img_path(img_path: str) -> np.ndarray:
-    """
-    Ritorna HxW con valori:
-      0   = IND
-      1   = OOD
-      255 = IGNORE
-    """
+def load_ood_gt_from_img_path(img_path: str, out_size=None) -> np.ndarray:
     pathGT = img_path.replace("images", "labels_masks")
+    pathGT = os.path.splitext(pathGT)[0] + ".png"
 
-    # fix estensioni
-    lower = pathGT.lower()
-    if "roadobsticle21" in lower or "roadobstacle21" in lower or "roadanomaly21" in lower:
-        pathGT = os.path.splitext(pathGT)[0] + ".png"
-    if "fs_static" in lower or "fishyscapes" in lower:
-        pathGT = os.path.splitext(pathGT)[0] + ".png"
-    if "roadanomaly" in lower:
-        pathGT = os.path.splitext(pathGT)[0] + ".png"
+    gt_pil = Image.open(pathGT)
+    if out_size is not None:
+        gt_pil = gt_pil.resize((out_size[1], out_size[0]), resample=Image.NEAREST)
 
-    mask = Image.open(pathGT)
-    mask = target_transform(mask)
-    ood_gts = np.array(mask)
+    gt = np.array(gt_pil)
+    uniq = set(np.unique(gt).tolist())
 
-    uniq = set(np.unique(ood_gts).tolist())
-
-    # RoadAnomaly legacy: {0,2} con 2=OOD
-    if ("roadanomaly" in lower) and ("roadanomaly21" not in lower) and (2 in uniq) and (1 not in uniq):
-        out = np.full_like(ood_gts, 255, dtype=np.uint8)
-        out[ood_gts == 0] = 0
-        out[ood_gts == 2] = 1
+    if uniq.issubset({0, 2}) and (2 in uniq):
+        out = np.zeros_like(gt, dtype=np.uint8)
+        out[gt == 2] = 1
         return out
 
-    # LostAndFound legacy (se capita ancora quel formato)
-    if "lostandfound" in lower:
-        # se già è {0,1,255} lo tengo
-        if uniq.issubset({0, 1, 255}):
-            return ood_gts.astype(np.uint8, copy=False)
+    if uniq.issubset({0, 1, 255}):
+        return gt.astype(np.uint8, copy=False)
 
-        # altrimenti applico la logica legacy e ripulisco in {0,1,255}
-        tmp = ood_gts.copy()
-        tmp = np.where((tmp == 0), 255, tmp)
-        tmp = np.where((tmp == 1), 0, tmp)
-        tmp = np.where((tmp > 1) & (tmp < 201), 1, tmp).astype(np.uint8)
+    if uniq.issubset({0, 255}):
+        return gt.astype(np.uint8, copy=False)
 
-        out = np.full_like(tmp, 255, dtype=np.uint8)
-        out[tmp == 0] = 0
-        out[tmp == 1] = 1
-        return out
-
-    # Default: mi aspetto {0,1,255}
-    if not uniq.issubset({0, 1, 255}):
-        raise ValueError(f"Unexpected GT values {sorted(uniq)} in {pathGT} (expected subset of {{0,1,255}})")
-
-    return ood_gts.astype(np.uint8, copy=False)
+    raise ValueError(f"Unexpected GT values {sorted(uniq)} in {pathGT}")
+   
 
 
 # -----------------------------------------------------------------------------
