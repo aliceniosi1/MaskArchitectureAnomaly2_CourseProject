@@ -167,6 +167,18 @@ def anomaly_map_from_pixel_scores(
 
     raise ValueError(f"Unknown method: {method}")
 
+#RBA
+@torch.no_grad()
+def anomaly_map_rba(
+    mask_logits: torch.Tensor,   
+    class_logits: torch.Tensor,  
+    temperature: float,
+) -> torch.Tensor:
+    mask_probs = mask_logits.sigmoid()
+    class_probs = torch.softmax(class_logits / temperature, dim=-1)[..., :-1]
+    query_scores = 1.0 - class_probs.max(dim=-1).values
+    amap = torch.einsum("bqhw,bq->bhw", mask_probs, query_scores)
+    return amap[0] 
 
 # -----------------------------------------------------------------------------
 # MAIN
@@ -238,34 +250,39 @@ def main():
     for idx, path in enumerate(img_paths, 1):
         try:
             img_pil = Image.open(path).convert("RGB")
-            images = input_transform(img_pil).unsqueeze(0).float().to(device)  # [1,3,H,W]
+            images = input_transform(img_pil).unsqueeze(0).float().to(device)
 
-            ood_gts = load_ood_gt_from_img_path(path, out_size=IMG_SIZE)  # HxW
-
+            ood_gts = load_ood_gt_from_img_path(path, out_size=IMG_SIZE)
 
             with torch.no_grad():
                 mask_logits_per_layer, class_logits_per_layer = model(images)
-                mask_logits = mask_logits_per_layer[-1]    # [B,Q,h,w]
-                class_logits = class_logits_per_layer[-1]  # [B,Q,C+1]
+                mask_logits = mask_logits_per_layer[-1]
+                class_logits = class_logits_per_layer[-1]
 
-                # upsample masks -> IMG_SIZE
                 mask_logits = F.interpolate(
                     mask_logits, size=IMG_SIZE, mode="bilinear", align_corners=False
                 )
 
                 for T in temps:
-                    pixel_scores_bchw = per_pixel_scores_with_temperature(
-                        mask_logits=mask_logits,
-                        class_logits=class_logits,
-                        temperature=T,
-                    )
-                    pixel_scores = pixel_scores_bchw[0]  # [C,H,W]
-
                     for method in methods:
-                        amap = anomaly_map_from_pixel_scores(pixel_scores, method=method)  # [H,W]
+                        if method == "rba":
+                            amap = anomaly_map_rba(
+                                mask_logits=mask_logits,
+                                class_logits=class_logits,
+                                temperature=T
+                            )
+                        else:
+                            pixel_scores_bchw = per_pixel_scores_with_temperature(
+                                mask_logits=mask_logits,
+                                class_logits=class_logits,
+                                temperature=T,
+                            )
+                            pixel_scores = pixel_scores_bchw[0]
+                            amap = anomaly_map_from_pixel_scores(pixel_scores, method=method)
+                        
                         amap_np = amap.detach().cpu().numpy().astype(np.float32, copy=False)
 
-                        valid_mask = (ood_gts <= 1)  # 0/1, escludo 255
+                        valid_mask = (ood_gts <= 1)
                         flat_labels = ood_gts[valid_mask].astype(np.uint8, copy=False).reshape(-1)
                         flat_pred = amap_np[valid_mask].astype(np.float32, copy=False).reshape(-1)
 
