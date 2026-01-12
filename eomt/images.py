@@ -1,6 +1,7 @@
 # export_best_image.py
-# Seleziona la "best image" (massimo AP per-image) e salva una figura 2x2:
-# Input / GT(OOD mask) / Prediction(semantic argmax) / Anomaly score
+# Seleziona la "best image" (massimo AP per-image) e salva sia:
+# (1) una figura 2x2 (grid PNG) che mostra Input / GT(OOD mask) / Prediction(semantic argmax) / Anomaly score
+# (2) quattro PNG separati (input, gt, pred, anomaly)
 #
 # Uso:
 # python export_best_image.py \
@@ -11,6 +12,78 @@
 #   --method msp \
 #   --out "/path/out/best_fs_static.png" \
 #   --exclude_no_ood
+# -----------------------------------------------------------------------------
+# Save a 2x2 grid PNG (as in the original script)
+# -----------------------------------------------------------------------------
+def save_best_grid(
+    out_path: str,
+    img_rgb: np.ndarray,
+    gt_ood: np.ndarray,
+    pred_sem: np.ndarray,
+    anomaly: np.ndarray,
+):
+    """Save a compact 2x2 grid figure to `out_path`.
+
+    Layout:
+      [0,0] Input (RGB)
+      [0,1] GT (OOD mask)
+      [1,0] Prediction (semantic argmax)
+      [1,1] Anomaly score (with small colorbar)
+    """
+    out_dir = os.path.dirname(out_path) or "."
+    os.makedirs(out_dir, exist_ok=True)
+
+    fig, axes = plt.subplots(
+        2,
+        2,
+        figsize=(10, 10),
+        gridspec_kw={"wspace": 0.02, "hspace": 0.02},
+    )
+
+    ax00, ax01 = axes[0]
+    ax10, ax11 = axes[1]
+
+    # --- Input ---
+    ax00.imshow(np.clip(img_rgb, 0.0, 1.0))
+    ax00.set_title("Input", fontsize=12)
+
+    # --- GT (OOD mask) ---
+    gt_vis = gt_ood.copy()
+    gt_vis[gt_vis == 255] = 0
+    ax01.imshow((gt_vis > 0).astype(np.uint8), cmap="gray", vmin=0, vmax=1)
+    ax01.set_title("GT (OOD)", fontsize=12)
+
+    # --- Prediction (semantic id) ---
+    cmap_pred = plt.get_cmap("tab20", NUM_CLASSES)
+    pred_clipped = (pred_sem.astype(np.int32) % NUM_CLASSES)
+    ax10.imshow(pred_clipped, cmap=cmap_pred, vmin=0, vmax=NUM_CLASSES - 1)
+    ax10.set_title("Prediction", fontsize=12)
+
+    # --- Anomaly map ---
+    a = anomaly.astype(np.float32)
+    a_min = float(np.nanmin(a))
+    a_max = float(np.nanmax(a))
+    if np.isfinite(a_min) and np.isfinite(a_max) and (a_max > a_min):
+        a_show = a
+    else:
+        a_show = np.zeros_like(a, dtype=np.float32)
+
+    im = ax11.imshow(a_show, cmap="viridis")
+    ax11.set_title("Anomaly", fontsize=12)
+
+    # small colorbar tight to the anomaly panel
+    divider = make_axes_locatable(ax11)
+    cax = divider.append_axes("right", size="4%", pad=0.02)
+    fig.colorbar(im, cax=cax)
+
+    for ax in [ax00, ax01, ax10, ax11]:
+        ax.axis("off")
+
+    # Compact save
+    fig.savefig(out_path, dpi=200, bbox_inches="tight", pad_inches=0.02)
+    plt.close(fig)
+
+    return out_path
 
 import os
 import glob
@@ -301,11 +374,18 @@ def main():
         raise RuntimeError("No valid image found (check paths/GT and exclude_no_ood).")
 
     img_rgb, gt_ood, pred_sem, anomaly = best_pack
+
+    # 1) Save the classic 2x2 grid to the exact path given by --out
+    grid_path = save_best_grid(args.out, img_rgb, gt_ood, pred_sem, anomaly)
+
+    # 2) Save also 4 separate PNGs using the same --out as prefix
     paths = save_best_images_separately(args.out, img_rgb, gt_ood, pred_sem, anomaly)
 
     print("\nBEST IMAGE:", best_path)
     print("BEST AP:", float(best_ap) * 100.0)
-    print("SAVED FILES:")
+    print("\nSAVED GRID:")
+    print(f"  - grid: {grid_path}")
+    print("\nSAVED SEPARATE FILES:")
     for k, v in paths.items():
         print(f"  - {k}: {v}")
 
