@@ -13,6 +13,25 @@
 #   --out "/path/out/best_fs_static.png" \
 #   --exclude_no_ood
 # -----------------------------------------------------------------------------
+import os
+import glob
+import random
+import sys
+from argparse import ArgumentParser
+from typing import List, Optional, Tuple
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from PIL import Image
+from torchvision.transforms import Compose, Resize, ToTensor
+
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+from compute_metrics import get_metrics
+
+# -----------------------------------------------------------------------------
 # Save a 2x2 grid PNG (as in the original script)
 # -----------------------------------------------------------------------------
 def save_best_grid(
@@ -84,24 +103,6 @@ def save_best_grid(
     plt.close(fig)
 
     return out_path
-
-import os
-import glob
-import random
-import sys
-from argparse import ArgumentParser
-from typing import List, Optional, Tuple
-
-import numpy as np
-import torch
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-from PIL import Image
-from torchvision.transforms import Compose, Resize, ToTensor
-
-from mpl_toolkits.axes_grid1 import make_axes_locatable
-
-from compute_metrics import get_metrics
 
 # -----------------------------------------------------------------------------
 # IMPORT EoMT (aggiungo la cartella eomt al PYTHONPATH)
