@@ -170,15 +170,25 @@ def anomaly_map_from_pixel_scores(
 #RBA
 @torch.no_grad()
 def anomaly_map_rba(
-    mask_logits: torch.Tensor,   
-    class_logits: torch.Tensor,  
+    mask_logits: torch.Tensor,   # [B,Q,H,W]
+    class_logits: torch.Tensor,  # [B,Q,C+1]
     temperature: float,
 ) -> torch.Tensor:
-    mask_probs = mask_logits.sigmoid()
+    mask_probs = mask_logits.sigmoid()                         # [B,Q,H,W]
     class_probs = torch.softmax(class_logits / temperature, dim=-1)[..., :-1]
-    query_scores = 1.0 - class_probs.max(dim=-1).values
-    amap = torch.einsum("bqhw,bq->bhw", mask_probs, query_scores)
-    return amap[0] 
+
+    # acceptance per query
+    query_accept = class_probs.max(dim=-1).values              # [B,Q]
+
+    # acceptance per pixel = max over queries
+    pixel_accept = torch.max(
+        mask_probs * query_accept[:, :, None, None],
+        dim=1
+    ).values                                                    # [B,H,W]
+
+    anomaly_map = 1.0 - pixel_accept
+    return anomaly_map[0]
+
 
 # -----------------------------------------------------------------------------
 # MAIN
