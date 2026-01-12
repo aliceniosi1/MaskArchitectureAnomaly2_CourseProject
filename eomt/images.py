@@ -162,8 +162,12 @@ def save_figure_2x2(out_path: str, img_rgb: np.ndarray, gt_ood: np.ndarray, pred
     gt_vis = gt_ood.copy()
     gt_vis[gt_vis == 255] = 0
 
-    # Use constrained_layout to keep spacing balanced
-    fig, axes = plt.subplots(2, 2, figsize=(14, 8), constrained_layout=True)
+    # Use constrained_layout but tighten its padding to reduce white space
+    fig, axes = plt.subplots(2, 2, figsize=(13, 7.5), constrained_layout=True)
+    try:
+        fig.set_constrained_layout_pads(w_pad=0.02, h_pad=0.02, wspace=0.02, hspace=0.02)
+    except Exception:
+        pass
 
     # Ensure axes are centered and have equal aspect
     for ax in axes.ravel():
@@ -172,31 +176,31 @@ def save_figure_2x2(out_path: str, img_rgb: np.ndarray, gt_ood: np.ndarray, pred
 
     # --- Input ---
     axes[0, 0].imshow(img_rgb)
-    axes[0, 0].set_title("Input")
+    axes[0, 0].set_title("Input", pad=4)
     axes[0, 0].axis("off")
 
     # --- GT ---
     axes[0, 1].imshow(gt_vis, vmin=0, vmax=1, interpolation="nearest")
-    axes[0, 1].set_title("Ground Truth (OOD mask)")
+    axes[0, 1].set_title("Ground Truth (OOD mask)", pad=4)
     axes[0, 1].axis("off")
 
     # --- Prediction ---
     axes[1, 0].imshow(pred_sem, interpolation="nearest")
-    axes[1, 0].set_title("Prediction (semantic id)")
+    axes[1, 0].set_title("Prediction (semantic id)", pad=4)
     axes[1, 0].axis("off")
 
     # --- Anomaly ---
     im = axes[1, 1].imshow(anomaly, interpolation="nearest")
-    axes[1, 1].set_title("Anomaly score")
+    axes[1, 1].set_title("Anomaly score", pad=4)
     axes[1, 1].axis("off")
 
     # Add a colorbar without messing up the grid geometry
     divider = make_axes_locatable(axes[1, 1])
-    cax = divider.append_axes("right", size="4%", pad=0.06)
+    cax = divider.append_axes("right", size="3%", pad=0.02)
     fig.colorbar(im, cax=cax)
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    fig.savefig(out_path, dpi=250, bbox_inches="tight")
+    fig.savefig(out_path, dpi=250, bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
 
 # -----------------------------------------------------------------------------
