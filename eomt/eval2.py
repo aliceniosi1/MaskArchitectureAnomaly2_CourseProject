@@ -268,7 +268,9 @@ def main():
                 mask_logits_per_layer, class_logits_per_layer = model(images)
                 mask_logits = mask_logits_per_layer[-1]
                 class_logits = class_logits_per_layer[-1]
-
+                if not (ood_gts == 1).any():
+                    skipped_no_ood += 1
+                    continue
                 mask_logits = F.interpolate(
                     mask_logits, size=IMG_SIZE, mode="bilinear", align_corners=False
                 )

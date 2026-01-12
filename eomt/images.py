@@ -26,6 +26,8 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from torchvision.transforms import Compose, Resize, ToTensor
 
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
 from compute_metrics import get_metrics
 
 # -----------------------------------------------------------------------------
@@ -153,30 +155,46 @@ def anomaly_map_from_pixel_scores(pixel_scores_chw: torch.Tensor, method: str, e
 # Save 2x2 figure
 # -----------------------------------------------------------------------------
 def save_figure_2x2(out_path: str, img_rgb: np.ndarray, gt_ood: np.ndarray, pred_sem: np.ndarray, anomaly: np.ndarray):
+    """Save a clean 2x2 figure: Input / GT(OOD) / Prediction / Anomaly.
+
+    Uses a dedicated colorbar axis (axes_grid1) to avoid squeezing other subplots.
+    """
     gt_vis = gt_ood.copy()
     gt_vis[gt_vis == 255] = 0
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 7))
-    axes = axes.ravel()
+    # Use constrained_layout to keep spacing balanced
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8), constrained_layout=True)
 
-    axes[0].imshow(img_rgb)
-    axes[0].set_title("Input")
-    axes[0].axis("off")
+    # Ensure axes are centered and have equal aspect
+    for ax in axes.ravel():
+        ax.set_anchor("C")
+        ax.set_aspect("equal")
 
-    axes[1].imshow(gt_vis, vmin=0, vmax=1)
-    axes[1].set_title("Ground Truth (OOD mask)")
-    axes[1].axis("off")
+    # --- Input ---
+    axes[0, 0].imshow(img_rgb)
+    axes[0, 0].set_title("Input")
+    axes[0, 0].axis("off")
 
-    axes[2].imshow(pred_sem, interpolation="nearest")
-    axes[2].set_title("Prediction (semantic id)")
-    axes[2].axis("off")
+    # --- GT ---
+    axes[0, 1].imshow(gt_vis, vmin=0, vmax=1, interpolation="nearest")
+    axes[0, 1].set_title("Ground Truth (OOD mask)")
+    axes[0, 1].axis("off")
 
-    im = axes[3].imshow(anomaly, interpolation="nearest")
-    axes[3].set_title("Anomaly score")
-    axes[3].axis("off")
-    fig.colorbar(im, ax=axes[3], fraction=0.046, pad=0.04)
+    # --- Prediction ---
+    axes[1, 0].imshow(pred_sem, interpolation="nearest")
+    axes[1, 0].set_title("Prediction (semantic id)")
+    axes[1, 0].axis("off")
 
-    plt.tight_layout()
+    # --- Anomaly ---
+    im = axes[1, 1].imshow(anomaly, interpolation="nearest")
+    axes[1, 1].set_title("Anomaly score")
+    axes[1, 1].axis("off")
+
+    # Add a colorbar without messing up the grid geometry
+    divider = make_axes_locatable(axes[1, 1])
+    cax = divider.append_axes("right", size="4%", pad=0.06)
+    fig.colorbar(im, cax=cax)
+
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     fig.savefig(out_path, dpi=250, bbox_inches="tight")
     plt.close(fig)
