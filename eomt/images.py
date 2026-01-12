@@ -152,56 +152,65 @@ def anomaly_map_from_pixel_scores(pixel_scores_chw: torch.Tensor, method: str, e
     raise ValueError(f"Unknown method: {method}")
 
 # -----------------------------------------------------------------------------
-# Save 2x2 figure
+# Save 4 separate PNGs instead of a 2x2 grid
 # -----------------------------------------------------------------------------
-def save_figure_2x2(out_path: str, img_rgb: np.ndarray, gt_ood: np.ndarray, pred_sem: np.ndarray, anomaly: np.ndarray):
-    """Save a clean 2x2 figure: Input / GT(OOD) / Prediction / Anomaly.
+def save_best_images_separately(
+    out_path: str,
+    img_rgb: np.ndarray,
+    gt_ood: np.ndarray,
+    pred_sem: np.ndarray,
+    anomaly: np.ndarray,
+):
+    """Save 4 separate PNGs instead of a 2x2 grid.
 
-    Uses a dedicated colorbar axis (axes_grid1) to avoid squeezing other subplots.
+    Given `out_path` like `/.../fs_static_best_msp_T1.png`, this will create:
+      - `/.../fs_static_best_msp_T1_input.png`
+      - `/.../fs_static_best_msp_T1_gt.png`
+      - `/.../fs_static_best_msp_T1_pred.png`
+      - `/.../fs_static_best_msp_T1_anomaly.png`
+
+    Returns a dict with the written paths.
     """
+    out_dir = os.path.dirname(out_path) or "."
+    stem = os.path.splitext(os.path.basename(out_path))[0]
+    os.makedirs(out_dir, exist_ok=True)
+
+    # --- Input (RGB) ---
+    img_u8 = (np.clip(img_rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
+    p_input = os.path.join(out_dir, f"{stem}_input.png")
+    Image.fromarray(img_u8).save(p_input)
+
+    # --- GT (OOD mask) ---
     gt_vis = gt_ood.copy()
     gt_vis[gt_vis == 255] = 0
+    gt_u8 = (gt_vis.astype(np.uint8) > 0).astype(np.uint8) * 255
+    p_gt = os.path.join(out_dir, f"{stem}_gt.png")
+    Image.fromarray(gt_u8, mode="L").save(p_gt)
 
-    # Use constrained_layout but tighten its padding to reduce white space
-    fig, axes = plt.subplots(2, 2, figsize=(13, 7.5), constrained_layout=True)
-    try:
-        fig.set_constrained_layout_pads(w_pad=0.02, h_pad=0.02, wspace=0.02, hspace=0.02)
-    except Exception:
-        pass
+    # --- Prediction (semantic id) colorized ---
+    # Colorize with a discrete colormap for readability
+    cmap_pred = plt.get_cmap("tab20", NUM_CLASSES)
+    pred_clipped = (pred_sem.astype(np.int32) % NUM_CLASSES)
+    pred_rgb = (cmap_pred(pred_clipped)[..., :3] * 255.0).astype(np.uint8)
+    p_pred = os.path.join(out_dir, f"{stem}_pred.png")
+    Image.fromarray(pred_rgb).save(p_pred)
 
-    # Ensure axes are centered and have equal aspect
-    for ax in axes.ravel():
-        ax.set_anchor("C")
-        ax.set_aspect("equal")
+    # --- Anomaly map colorized ---
+    # Normalize per-image for visualization
+    a = anomaly.astype(np.float32)
+    a_min = float(np.nanmin(a))
+    a_max = float(np.nanmax(a))
+    if np.isfinite(a_min) and np.isfinite(a_max) and (a_max > a_min):
+        a_norm = (a - a_min) / (a_max - a_min)
+    else:
+        a_norm = np.zeros_like(a, dtype=np.float32)
 
-    # --- Input ---
-    axes[0, 0].imshow(img_rgb)
-    axes[0, 0].set_title("Input", pad=4)
-    axes[0, 0].axis("off")
+    cmap_a = plt.get_cmap("viridis")
+    a_rgb = (cmap_a(np.clip(a_norm, 0.0, 1.0))[..., :3] * 255.0).astype(np.uint8)
+    p_anom = os.path.join(out_dir, f"{stem}_anomaly.png")
+    Image.fromarray(a_rgb).save(p_anom)
 
-    # --- GT ---
-    axes[0, 1].imshow(gt_vis, vmin=0, vmax=1, interpolation="nearest")
-    axes[0, 1].set_title("Ground Truth (OOD mask)", pad=4)
-    axes[0, 1].axis("off")
-
-    # --- Prediction ---
-    axes[1, 0].imshow(pred_sem, interpolation="nearest")
-    axes[1, 0].set_title("Prediction (semantic id)", pad=4)
-    axes[1, 0].axis("off")
-
-    # --- Anomaly ---
-    im = axes[1, 1].imshow(anomaly, interpolation="nearest")
-    axes[1, 1].set_title("Anomaly score", pad=4)
-    axes[1, 1].axis("off")
-
-    # Add a colorbar without messing up the grid geometry
-    divider = make_axes_locatable(axes[1, 1])
-    cax = divider.append_axes("right", size="3%", pad=0.02)
-    fig.colorbar(im, cax=cax)
-
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    fig.savefig(out_path, dpi=250, bbox_inches="tight", pad_inches=0.02)
-    plt.close(fig)
+    return {"input": p_input, "gt": p_gt, "pred": p_pred, "anomaly": p_anom}
 
 # -----------------------------------------------------------------------------
 # MAIN
@@ -292,11 +301,13 @@ def main():
         raise RuntimeError("No valid image found (check paths/GT and exclude_no_ood).")
 
     img_rgb, gt_ood, pred_sem, anomaly = best_pack
-    save_figure_2x2(args.out, img_rgb, gt_ood, pred_sem, anomaly)
+    paths = save_best_images_separately(args.out, img_rgb, gt_ood, pred_sem, anomaly)
 
     print("\nBEST IMAGE:", best_path)
     print("BEST AP:", float(best_ap) * 100.0)
-    print("SAVED:", args.out)
+    print("SAVED FILES:")
+    for k, v in paths.items():
+        print(f"  - {k}: {v}")
 
 if __name__ == "__main__":
     main()
