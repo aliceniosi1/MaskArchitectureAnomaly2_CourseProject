@@ -266,7 +266,7 @@ def plot_compare_hist(
     axes[1].set_xlabel("MSP anomaly score (1 - max prob)")
     axes[1].legend()
 
-    fig.suptitle(f"{dataset_name}: MSP score distributions (IND vs OOD)", y=0.98)
+    fig.suptitle(f"RoadObstacle21: MSP score distributions (IND vs OOD)", y=0.98)
     fig.tight_layout()
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
