@@ -1,20 +1,24 @@
+# evaluation_ts.py
 # Copyright (c) OpenMMLab. All rights reserved.
+
 import os
-import sys
 import glob
 import random
-import torch
+import sys
+import csv
+from argparse import ArgumentParser
+from typing import Dict, List, Tuple
+
 import numpy as np
+import torch
 import torch.nn.functional as F
 from PIL import Image
-from argparse import ArgumentParser
-from sklearn.metrics import average_precision_score, roc_curve
 from torchvision.transforms import Compose, Resize, ToTensor
+from compute_metrics import get_metrics
 
 # -----------------------------------------------------------------------------
-# SETUP PATH & IMPORTS
+# IMPORT EoMT (aggiungo la cartella eomt al PYTHONPATH)
 # -----------------------------------------------------------------------------
-# Aggiungiamo dinamicamente la root del progetto al path per importare i moduli custom
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.join(CURRENT_DIR, "..")
 EOMT_ROOT = os.path.join(PROJECT_ROOT, "eomt")
@@ -27,63 +31,39 @@ from models.eomt import EoMT
 from training.lightning_module import LightningModule
 
 # -----------------------------------------------------------------------------
-# CONFIGURAZIONE & PARAMETRI
+# CONFIG DI BASE
 # -----------------------------------------------------------------------------
-SEED = 42
-NUM_CLASSES = 19              # Classi Cityscapes
-IMG_SIZE = (1024, 1024)       # Risoluzione input/output coerente col training
+seed = 42
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+
+NUM_CLASSES = 19
+IMG_SIZE = (1024, 1024)  # (H,W)
 NUM_QUERIES = 100
 NUM_BLOCKS = 3
 BACKBONE_NAME = "vit_base_patch14_reg4_dinov2"
 
-# Setup riproducibilità
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = True
 
-# Trasformazioni Input/Target
-input_transform = Compose([
-    Resize(IMG_SIZE, Image.BILINEAR),
-    ToTensor(),
-])
+input_transform = Compose(
+    [
+        Resize(IMG_SIZE, Image.BILINEAR),
+        ToTensor(),
+    ]
+)
 
-target_transform = Compose([
-    Resize(IMG_SIZE, Image.NEAREST),
-])
+IGNORE_LABEL = 255
 
 # -----------------------------------------------------------------------------
-# FUNZIONI DI UTILITÀ
+# MODEL LOADER
 # -----------------------------------------------------------------------------
-
-def fpr_at_95_tpr(scores: np.ndarray, labels: np.ndarray) -> float:
-    """
-    Calcola il False Positive Rate (FPR) quando il True Positive Rate (TPR) è al 95%.
-    
-    Args:
-        scores: array dei punteggi di anomalia.
-        labels: array binario delle etichette (1 = anomalia, 0 = in-distribution).
-    """
-    fpr, tpr, _ = roc_curve(labels, scores, pos_label=1)
-    
-    # Trova gli indici dove il TPR supera il 95%
-    idxs = np.where(tpr >= 0.95)[0]
-    
-    if len(idxs) == 0:
-        return 1.0  # Fallback pessimistico se non si raggiunge il target TPR
-
-    return float(fpr[idxs[0]])
-
 def load_eomt_model(ckpt_path: str, device: torch.device) -> EoMT:
-    """
-    Inizializza l'architettura EoMT (Backbone ViT + Decoder) e carica i pesi
-    usando la logica del LightningModule originale.
-    """
-    print(f"--> Inizializzazione Backbone: {BACKBONE_NAME}")
-    encoder = ViT(img_size=IMG_SIZE, backbone_name=BACKBONE_NAME)
-
-    print(f"--> Inizializzazione EoMT Network (Classes: {NUM_CLASSES}, Queries: {NUM_QUERIES})")
+    encoder = ViT(
+        img_size=IMG_SIZE,
+        backbone_name=BACKBONE_NAME,
+    )
     network = EoMT(
         encoder=encoder,
         num_classes=NUM_CLASSES,
@@ -92,7 +72,6 @@ def load_eomt_model(ckpt_path: str, device: torch.device) -> EoMT:
         masked_attn_enabled=True,
     )
 
-    # Utilizziamo il LightningModule come wrapper per il caricamento sicuro dei pesi
     lm = LightningModule(
         network=network,
         img_size=IMG_SIZE,
@@ -113,197 +92,326 @@ def load_eomt_model(ckpt_path: str, device: torch.device) -> EoMT:
     )
 
     model = lm.network
-    model.to(device)
-    model.eval()
+    model.to(device).eval()
     return model
 
-def compute_anomaly_map(logits: torch.Tensor, method: str) -> torch.Tensor:
-    """
-    Genera una mappa di anomalia pixel-wise a partire dai logits semantici.
-    
-    Args:
-        logits: Tensore [C, H, W]
-        method: Strategia di scoring ('msp', 'maxlogit', 'maxentropy', 'rba')
-    """
-    probs = F.softmax(logits, dim=0)
+# -----------------------------------------------------------------------------
+# GT loader: tiene {0,1,255} invariato, converte RoadAnomaly {0,2} -> {0,1}
+# -----------------------------------------------------------------------------
+def load_ood_gt_from_img_path(img_path: str, out_size=None) -> np.ndarray:
+    pathGT = img_path.replace("images", "labels_masks")
+    pathGT = os.path.splitext(pathGT)[0] + ".png"
 
-    if method == "msp":
-        # Maximum Softmax Probability: Score = 1 - max(P(y|x))
-        msp = probs.max(dim=0).values
-        anomaly_map = 1.0 - msp
+    gt_pil = Image.open(pathGT).convert("L")
 
-    elif method == "maxlogit":
-        # Max Logit: Score = -max(Logits)
-        maxlogit = logits.max(dim=0).values
-        anomaly_map = -maxlogit
+    # Se ridimensioni le immagini in input, ridimensiona anche la GT per allinearla
+    if out_size is not None:
+        gt_pil = gt_pil.resize((out_size[1], out_size[0]), resample=Image.NEAREST)  # (W,H)
 
-    elif method == "maxentropy":
-        # Entropia: Score = H(P(y|x))
-        eps = 1e-8
-        entropy = -(probs * (probs + eps).log()).sum(dim=0)
-        anomaly_map = entropy
+    gt = np.array(gt_pil)
+    uniq = set(np.unique(gt).tolist())
 
-    elif method == "rba":
-        # Reject-Based Acceptance (semplificato)
-        #msp = probs.max(dim=0).values
-        #accept_threshold = 0.5
-        #anomaly_map = torch.clamp(accept_threshold - msp, min=0) / accept_threshold
+    # RoadAnomaly: {0,2} con 2=OOD
+    if uniq.issubset({0, 2}):
+        out = np.zeros_like(gt, dtype=np.uint8)
+        out[gt == 2] = 1
+        return out
 
-        anomaly_map = -logits.tanh().sum(dim=0)
+    # Standard: {0,1,255}
+    if uniq.issubset({0, 1, 255}):
+        return gt.astype(np.uint8, copy=False)
 
-    else:
-        raise ValueError(f"Metodo anomalia non supportato: {method}")
+    # Alcuni casi possono essere {0,255} (immagini senza OOD)
+    if uniq.issubset({0, 255}):
+        return gt.astype(np.uint8, copy=False)
 
-    return anomaly_map
+    raise ValueError(f"Unexpected GT values {sorted(uniq)} in {pathGT}")
 
 # -----------------------------------------------------------------------------
-# MAIN LOOP
+# Combine (mask_logits, class_logits) with temperature on class logits
+# -----------------------------------------------------------------------------
+@torch.no_grad()
+def per_pixel_scores_with_temperature(
+    mask_logits: torch.Tensor,   # [B,Q,H,W]
+    class_logits: torch.Tensor,  # [B,Q,C+1]
+    temperature: float,
+) -> torch.Tensor:
+    if temperature <= 0:
+        raise ValueError("temperature must be > 0")
+
+    mask_probs = mask_logits.sigmoid()
+    class_probs = torch.softmax(class_logits / temperature, dim=-1)[..., :-1]  # drop void class
+
+    pixel_scores = torch.einsum("bqhw,bqc->bchw", mask_probs, class_probs)
+    return pixel_scores
+
+# -----------------------------------------------------------------------------
+# OOD scoring methods from pixel scores
+# -----------------------------------------------------------------------------
+@torch.no_grad()
+def anomaly_map_from_pixel_scores(
+    pixel_scores_chw: torch.Tensor, method: str, eps: float = 1e-8
+) -> torch.Tensor:
+    method = method.lower()
+    probs = torch.softmax(pixel_scores_chw, dim=0)
+
+    if method == "msp":
+        return 1.0 - probs.max(dim=0).values
+
+    if method == "maxentropy":
+        ent = -(probs * probs.clamp_min(eps).log()).sum(dim=0)
+        return ent
+
+    if method == "maxlogit":
+        return -pixel_scores_chw.max(dim=0).values
+
+    raise ValueError(f"Unknown method: {method}")
+
+#RBA
+@torch.no_grad()
+def anomaly_map_rba(
+    mask_logits: torch.Tensor,   # [B,Q,H,W]
+    class_logits: torch.Tensor,  # [B,Q,C+1]
+    temperature: float,
+) -> torch.Tensor:
+    mask_probs = mask_logits.sigmoid()                         # [B,Q,H,W]
+    class_probs = torch.softmax(class_logits / temperature, dim=-1)[..., :-1]
+
+    # acceptance per query
+    query_accept = class_probs.max(dim=-1).values              # [B,Q]
+
+    # acceptance per pixel = max over queries
+    pixel_accept = torch.max(
+        mask_probs * query_accept[:, :, None, None],
+        dim=1
+    ).values                                                    # [B,H,W]
+
+    anomaly_map = 1.0 - pixel_accept
+    return anomaly_map[0]
+
+
+# -----------------------------------------------------------------------------
+# MAIN
 # -----------------------------------------------------------------------------
 def main():
     parser = ArgumentParser()
-    parser.add_argument("--input", nargs="+", default="/home/shyam/Mask2Former/unk-eval/RoadObsticle21/images/*.webp", help="Path o glob pattern immagini input")
-    parser.add_argument("--loadDir", default="../trained_models/", help="Cartella dei modelli salvati")
-    parser.add_argument("--loadWeights", default="eomt_cityscapes.bin", help="Nome file checkpoint")
-    parser.add_argument("--method", default="msp", choices=["msp", "maxlogit", "maxentropy", "rba"], help="Metodo score anomalia")
-    parser.add_argument("--cpu", action="store_true", help="Forza esecuzione su CPU")
+    parser.add_argument(
+        "--input", nargs="+", required=True,
+        help="Glob, es: '/content/.../images/*.jpg'"
+    )
+    parser.add_argument("--loadDir", required=True)
+    parser.add_argument("--loadWeights", default="eomt_cityscapes.bin")
+    parser.add_argument(
+        "--temperatures", nargs="+", type=float, required=True,
+        help="Lista di T, es: 0.5 0.75 1.0 1.5 2.0"
+    )
+    parser.add_argument(
+        "--methods", nargs="+", default=["msp"],
+        help="Metodi OOD: msp maxentropy maxlogit. Accetto anche virgole: --methods msp,maxentropy"
+    )
+    parser.add_argument("--cpu", action="store_true")
+    parser.add_argument("--max_images", type=int, default=-1, help="Debug. -1=tutte.")
+    parser.add_argument(
+        "--out_csv", type=str, default=None,
+        help="Path CSV output (opzionale). Se non specificato, non salva nulla."
+    )
     args = parser.parse_args()
 
-    # Configurazione Device
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
-    print(f"Device in uso: {device}")
 
-    # Preparazione file output
-    if not os.path.exists("results.txt"):
-        open("results.txt", "w").close()
-    
-    ckpt_full_path = os.path.join(args.loadDir, args.loadWeights)
-    print(f"Caricamento pesi da: {ckpt_full_path}")
+    ckpt_path = os.path.join(args.loadDir, args.loadWeights)
+    print("Loading EoMT checkpoint:", ckpt_path)
+    model = load_eomt_model(ckpt_path, device)
+    print("Model LOADED successfully (EoMT + DINOv2)")
 
-    # Caricamento Modello
-    try:
-        model = load_eomt_model(ckpt_full_path, device)
-        print("Modello caricato con successo.")
-    except Exception as e:
-        print(f"Errore critico nel caricamento del modello: {e}")
-        return
+    # Parse methods (accetto sia spazi che virgole)
+    methods: List[str] = []
+    for m in args.methods:
+        methods.extend([x.strip() for x in str(m).split(",") if x.strip()])
+    methods = [m.lower() for m in methods]
+    temps = [float(t) for t in args.temperatures]
 
-    # Liste per accumulo risultati
-    anomaly_score_list = []
-    ood_gts_list = []
-    
-    file_list = glob.glob(os.path.expanduser(str(args.input[0])))
-    print(f"Trovate {len(file_list)} immagini da elaborare.")
+    print("Device:", device)
+    print("IMG_SIZE:", IMG_SIZE)
+    print("Temps:", temps)
+    print("Methods:", methods)
 
-    # -------------------------------------------------------------------------
-    # INIZIO ELABORAZIONE BATCH
-    # -------------------------------------------------------------------------
-    for path in file_list:
-        print(f"Processing: {path}")
+    # Build list immagini
+    img_paths: List[str] = []
+    for pat in args.input:
+        img_paths.extend(glob.glob(os.path.expanduser(str(pat))))
+    img_paths = sorted(list(set(img_paths)))
 
-        # 1. Inferenza
-        img_pil = Image.open(path).convert("RGB")
-        img_tensor = input_transform(img_pil).unsqueeze(0).float().to(device)
+    if not img_paths:
+        raise FileNotFoundError(f"No images matched input: {args.input}")
 
-        with torch.no_grad():
-            # EoMT forward pass
-            mask_logits_layers, class_logits_layers = model(img_tensor)
+    if args.max_images > 0:
+        img_paths = img_paths[: args.max_images]
 
-            # Estrazione output dall'ultimo layer
-            final_mask_logits = mask_logits_layers[-1]    # [B, Q, h, w]
-            final_class_logits = class_logits_layers[-1]  # [B, Q, C+1]
+    # Accumulator per get_metrics: per (T,method) salvo labels/pred flatten (solo valid 0/1)
+    acc: Dict[Tuple[float, str], Dict[str, List[np.ndarray]]] = {
+        (float(t), m): {"labels": [], "pred": []} for t in temps for m in methods
+    }
 
-            # Upsample alla risoluzione originale
-            final_mask_logits = F.interpolate(
-                final_mask_logits, size=IMG_SIZE, mode="bilinear", align_corners=False
-            )
+    processed = 0
+    skipped_no_ood = 0
+    errors = 0
 
-            # Conversione in Semantic Logits standard [B, C, H, W]
-            per_pixel_logits = LightningModule.to_per_pixel_logits_semantic(
-                final_mask_logits, final_class_logits
-            )
-            pixel_logits = per_pixel_logits[0] # Rimuovi batch dimension -> [C, H, W]
-
-            # Calcolo Mappa Anomalia
-            anomaly_map = compute_anomaly_map(pixel_logits, args.method)
-            anomaly_np = anomaly_map.detach().cpu().numpy()
-
-        # 2. Caricamento e Adattamento Ground Truth (Labels)
-        pathGT = path.replace("images", "labels_masks")
-        
-        # Gestione estensioni file specifiche per dataset
-        if "RoadObsticle21" in pathGT: pathGT = pathGT.replace("webp", "png")
-        if "fs_static" in pathGT: pathGT = pathGT.replace("jpg", "png")
-        if "RoadAnomaly" in pathGT: pathGT = pathGT.replace("jpg", "png")
-
+    for idx, path in enumerate(img_paths, 1):
         try:
-            gt_img = Image.open(pathGT)
-        except FileNotFoundError:
-            print(f"Warning: GT non trovata per {path}, skip.")
-            continue
+            img_pil = Image.open(path).convert("RGB")
+            images = input_transform(img_pil).unsqueeze(0).float().to(device)
 
-        gt_img = target_transform(gt_img)
-        ood_gts = np.array(gt_img)
+            ood_gts = load_ood_gt_from_img_path(path, out_size=IMG_SIZE)
 
-        # Mappatura Labels Dataset -> Formato Binario (0=In-Dist, 1=OOD, 255=Ignore)
-        if "RoadAnomaly" in pathGT:
-            ood_gts = np.where((ood_gts == 2), 1, ood_gts)
-        elif "LostAndFound" in pathGT:
-            ood_gts = np.where((ood_gts == 0), 255, ood_gts)
-            ood_gts = np.where((ood_gts == 1), 0, ood_gts)
-            ood_gts = np.where((ood_gts > 1) & (ood_gts < 201), 1, ood_gts)
-        elif "Streethazard" in pathGT:
-            ood_gts = np.where((ood_gts == 14), 255, ood_gts)
-            ood_gts = np.where((ood_gts < 20), 0, ood_gts)
-            ood_gts = np.where((ood_gts == 255), 1, ood_gts)
+            with torch.no_grad():
+                mask_logits_per_layer, class_logits_per_layer = model(images)
+                mask_logits = mask_logits_per_layer[-1]
+                class_logits = class_logits_per_layer[-1]
+                if not (ood_gts == 1).any():
+                    skipped_no_ood += 1
+                    continue
+                mask_logits = F.interpolate(
+                    mask_logits, size=IMG_SIZE, mode="bilinear", align_corners=False
+                )
 
-        # Se l'immagine non contiene pixel OOD validi, la saltiamo
-        if 1 not in np.unique(ood_gts):
-            continue
+                for T in temps:
+                    for method in methods:
+                        if method == "rba":
+                            amap = anomaly_map_rba(
+                                mask_logits=mask_logits,
+                                class_logits=class_logits,
+                                temperature=T
+                            )
+                        else:
+                            pixel_scores_bchw = per_pixel_scores_with_temperature(
+                                mask_logits=mask_logits,
+                                class_logits=class_logits,
+                                temperature=T,
+                            )
+                            pixel_scores = pixel_scores_bchw[0]
+                            amap = anomaly_map_from_pixel_scores(pixel_scores, method=method)
+                        
+                        amap_np = amap.detach().cpu().numpy().astype(np.float32, copy=False)
 
-        ood_gts_list.append(ood_gts)
-        anomaly_score_list.append(anomaly_np)
+                        valid_mask = (ood_gts <= 1)
+                        flat_labels = ood_gts[valid_mask].astype(np.uint8, copy=False).reshape(-1)
+                        flat_pred = amap_np[valid_mask].astype(np.float32, copy=False).reshape(-1)
 
-        # Pulizia memoria GPU
-        del img_tensor, anomaly_map, pixel_logits
-        torch.cuda.empty_cache()
+                        key = (float(T), method)
+                        if flat_labels.size > 0:
+                            acc[key]["labels"].append(flat_labels)
+                            acc[key]["pred"].append(flat_pred)
+
+            processed += 1
+
+            if idx % 10 == 0:
+                print(f"[{idx}/{len(img_paths)}] processed={processed} skipped_no_ood={skipped_no_ood} errors={errors}")
+
+            del images
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        except Exception as e:
+            errors += 1
+            print(f"ERROR on {path}: {e}")
+
+    print("\n--- DONE FORWARD ---")
+    print(f"Images matched:      {len(img_paths)}")
+    print(f"Processed:           {processed}")
+    print(f"Images without OOD:  {skipped_no_ood}")
+    print(f"Errors:              {errors}")
 
     # -------------------------------------------------------------------------
-    # CALCOLO METRICHE FINALI
+    # Metrics via get_metrics (che hai già)
     # -------------------------------------------------------------------------
-    if not ood_gts_list:
-        print("Nessun dato valido raccolto per la valutazione.")
-        return
+    print("\n=== RESULTS (Fishyscapes get_metrics) ===")
+    print("Method      Temp     |  AUPRC(%)   AUROC(%)  FPR@95(%)")
+    print("-------------------------------------------------------")
 
-    print("Calcolo metriche in corso...")
-    
-    # Flattening array per calcolo globale
-    ood_gts_flat = np.array(ood_gts_list)
-    anomaly_scores_flat = np.array(anomaly_score_list)
+    best_by_method: Dict[str, Tuple[float, float]] = {}
+    rows: List[dict] = []
 
-    # Maschere booleane
-    ood_mask = (ood_gts_flat == 1)
-    ind_mask = (ood_gts_flat == 0)
+    for (T, method) in sorted(acc.keys(), key=lambda x: (x[1], x[0])):
+        lab_list = acc[(T, method)]["labels"]
+        pred_list = acc[(T, method)]["pred"]
 
-    # Estrazione punteggi
-    ood_scores = anomaly_scores_flat[ood_mask]
-    ind_scores = anomaly_scores_flat[ind_mask]
+        if len(lab_list) == 0:
+            print(f"{method:<10s} {T:<8.3f} | (no valid pixels)")
+            continue
 
-    # Creazione etichette per Sklearn
-    all_scores = np.concatenate((ind_scores, ood_scores))
-    all_labels = np.concatenate((np.zeros(len(ind_scores)), np.ones(len(ood_scores))))
+        flat_labels = np.concatenate(lab_list, axis=0)
+        flat_pred = np.concatenate(pred_list, axis=0)
 
-    # Metriche
-    auprc = average_precision_score(all_labels, all_scores)
-    fpr95 = fpr_at_95_tpr(all_scores, all_labels)
+        # Se non ci sono positivi in tutto il set, AP/FPR@95 non sono definiti
+        n_pos = int(np.sum(flat_labels == 1))
+        if n_pos == 0:
+            print(f"{method:<10s} {T:<8.3f} | (no positives in GT)")
+            continue
 
-    result_str = f"[EoMT-{args.method}] AUPRC: {auprc * 100.0:.2f}% | FPR@95TPR: {fpr95 * 100.0:.2f}%"
-    print("\n" + "="*50)
-    print(result_str)
-    print("="*50 + "\n")
+        # get_metrics deve essere definita/importata da te (tu hai già la funzione)
+        res = get_metrics(flat_labels, flat_pred, num_points=50)
 
-    # Scrittura su file
-    with open("results.txt", "a") as f:
-        f.write("\n" + result_str)
+        ap = float(res["AP"]) * 100.0
+        auroc = float(res["auroc"]) * 100.0
+        fpr95 = float(res["FPR@95%TPR"]) * 100.0
+
+        print(f"{method:<10s} {T:<8.3f} | {ap:7.2f}  {auroc:8.2f}  {fpr95:9.2f}")
+
+        rows.append({
+            "method": str(method),
+            "temperature": float(T),
+            "AP_percent": float(ap),
+            "AUROC_percent": float(auroc),
+            "FPR95_percent": float(fpr95),
+            "n_pixels_valid": int(flat_labels.size),
+            "n_pos_pixels": int(n_pos),
+            "images_matched": int(len(img_paths)),
+            "images_processed": int(processed),
+            "images_without_ood": int(skipped_no_ood),
+            "errors": int(errors),
+            "weights": str(ckpt_path),
+            "img_size_h": int(IMG_SIZE[0]),
+            "img_size_w": int(IMG_SIZE[1]),
+        })
+
+        if (method not in best_by_method) or (ap > best_by_method[method][1]):
+            best_by_method[method] = (float(T), float(ap))
+
+    for m, (bt, ba) in best_by_method.items():
+        print(f"\nBest T by AUPRC for {m}: T={bt} (AP={ba:.2f}%)")
+
+    # ---------------------------------------------------------------------
+    # Save CSV (optional)
+    # ---------------------------------------------------------------------
+    if args.out_csv is not None:
+        out_csv = args.out_csv
+        out_dir = os.path.dirname(out_csv)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
+        # aggiungo info best per method in ogni riga
+        for r in rows:
+            m = r["method"]
+            best = best_by_method.get(m, (None, None))
+            r["best_T_by_AP_for_method"] = best[0]
+            r["best_AP_percent_for_method"] = best[1]
+
+        fieldnames = [
+            "method", "temperature",
+            "AP_percent", "AUROC_percent", "FPR95_percent",
+            "n_pixels_valid", "n_pos_pixels",
+            "images_matched", "images_processed", "images_without_ood", "errors",
+            "weights", "img_size_h", "img_size_w",
+            "best_T_by_AP_for_method", "best_AP_percent_for_method",
+        ]
+
+        with open(out_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+        print(f"\nCSV salvato in: {out_csv}")
 
 if __name__ == "__main__":
     main()
