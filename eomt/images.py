@@ -56,7 +56,7 @@ def save_best_grid(
         2,
         2,
         figsize=(10, 10),
-        gridspec_kw={"wspace": 0.02, "hspace": 0.02},
+        gridspec_kw={"wspace": 0.02, "hspace": 0.10},
     )
 
     ax00, ax01 = axes[0]
@@ -64,19 +64,19 @@ def save_best_grid(
 
     # --- Input ---
     ax00.imshow(np.clip(img_rgb, 0.0, 1.0))
-    ax00.set_title("Input", fontsize=12)
+    ax00.set_title("Input", fontsize=12, pad=10)
 
     # --- GT (OOD mask) ---
     gt_vis = gt_ood.copy()
     gt_vis[gt_vis == 255] = 0
     ax01.imshow((gt_vis > 0).astype(np.uint8), cmap="gray", vmin=0, vmax=1)
-    ax01.set_title("GT (OOD)", fontsize=12)
+    ax01.set_title("GT (OOD)", fontsize=12, pad=10)
 
     # --- Prediction (semantic id) ---
     cmap_pred = plt.get_cmap("tab20", NUM_CLASSES)
     pred_clipped = (pred_sem.astype(np.int32) % NUM_CLASSES)
     ax10.imshow(pred_clipped, cmap=cmap_pred, vmin=0, vmax=NUM_CLASSES - 1)
-    ax10.set_title("Prediction", fontsize=12)
+    ax10.set_title("Prediction", fontsize=12, pad=10)
 
     # --- Anomaly map ---
     a = anomaly.astype(np.float32)
@@ -88,7 +88,7 @@ def save_best_grid(
         a_show = np.zeros_like(a, dtype=np.float32)
 
     im = ax11.imshow(a_show, cmap="viridis")
-    ax11.set_title("Anomaly", fontsize=12)
+    ax11.set_title("Anomaly", fontsize=12, pad=10)
 
     # small colorbar tight to the anomaly panel
     divider = make_axes_locatable(ax11)
@@ -99,7 +99,7 @@ def save_best_grid(
         ax.axis("off")
 
     # Compact save
-    fig.savefig(out_path, dpi=200, bbox_inches="tight", pad_inches=0.02)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight", pad_inches=0.10)
     plt.close(fig)
 
     return out_path
